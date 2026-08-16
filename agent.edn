@@ -1,0 +1,72 @@
+{:plugins
+ [{:ns agent.plugins.session
+   :config {:path nil}}
+
+  {:ns agent.plugins.session-catalog}
+
+  {:ns agent.plugins.auth-store}
+
+  {:ns agent.plugins.model-registry
+   :config {:default-provider :chatgpt}}
+
+  {:ns agent.plugins.chatgpt
+   :config {:model "gpt-5.6-sol"
+            :timeout-ms 180000
+            :connect-timeout-ms 15000
+            :http-version :http1.1
+            :transport-retries 4
+            :retry-delay-ms 400
+            :extra-body {:reasoning {:effort "medium"}}}}
+
+  {:ns agent.plugins.execution-world
+   :config {:root "."
+            :timeout-ms 30000
+            :max-output-chars 50000}}
+
+  {:ns agent.plugins.tools
+   :config {:max-read-chars 50000}}
+
+  {:ns agent.plugins.bb-repl
+   :config {:root "."
+            :sandbox :auto
+            :timeout-ms 10000
+            :max-output-chars 20000}}
+
+  {:ns agent.plugins.clojure-repl}
+
+  {:ns agent.plugins.trust
+   :config {:root "."}}
+
+  {:ns agent.plugins.resources
+   :config {:root "."}}
+
+  {:ns agent.plugins.approval
+   ;; Change to :ask for a confirmation before each bb_repl call.
+   :config {:mode :allow}}
+
+  {:ns agent.plugins.policy
+   :config {:deny-tools []
+            :trusted-tools ["write" "edit" "bash" "bb_repl"]
+            :approval-tools ["write" "edit" "bash" "bb_repl"]}}
+
+  {:ns agent.plugins.trace
+   :config {:enabled true
+            :show-results true}}
+
+  {:ns agent.plugins.stream-console}
+
+  {:ns agent.plugins.context-manager
+   :config {:context-window 128000
+            :reserve-tokens 16384
+            :retain-messages 12}}
+
+  {:ns agent.plugins.runtime
+   :config {:max-steps 12
+            :system-prompt
+            "You are a concise coding assistant. Use read, write, edit, bash, grep, find, and ls to work accurately in the project. Use bb_repl for exact calculations and Clojure data transformations. Never invent tool results."}}
+
+  {:ns agent.plugins.tui
+   :config {:root "."
+            :screen :alternate
+            :mouse true
+            :theme :midnight}}]}

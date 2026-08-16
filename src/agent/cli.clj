@@ -1,0 +1,270 @@
+(ns agent.cli
+  (:require [agent.command :as command]
+            [agent.kernel :as kernel]
+            [agent.plugin :as plugin]
+            [agent.protocol :as protocol]
+            [agent.plugins.trust :as trust]
+            [clojure.string :as str]))
+
+(defn- session-plugin-index [plugins]
+  (first
+   (keep-indexed
+    (fn [index spec]
+      (when (= 'agent.plugins.session (:ns spec)) index))
+    plugins)))
+
+(def usage
+  (str "Babashka plugin LLM agent\n\n"
+       "  bb agent [--config agent.edn] --once \"prompt\"\n"
+       "  bb agent [--config agent.edn] --provider PROVIDER --once \"prompt\"\n"
+       "  bb agent [--config agent.edn] --mode json --once \"prompt\"\n"
+       "  bb agent [--config agent.edn] --mode tui\n"
+       "  bb agent [--config agent.edn] --mode rpc\n"
+       "  bb agent [--config agent.edn]\n"
+       "  bb agent [--config agent.edn] --list\n"
+       "  bb agent --session PATH [--once \"prompt\"]\n"
+       "  bb agent --session PATH --fork DESTINATION\n"
+       "  bb agent --session PATH --compact\n"
+       "  bb agent --session PATH --session-info\n"))
+
+(defn- parse-args [args]
+  (loop [remaining args
+         options {:config "agent.edn"}]
+    (if-let [argument (first remaining)]
+      (case argument
+        "--config" (if-let [path (second remaining)]
+                     (recur (nnext remaining) (assoc options :config path))
+                     (throw (ex-info "--config requires a path" {})))
+        "--once" (if-let [prompt (second remaining)]
+                   (recur (nnext remaining) (assoc options :prompt prompt))
+                     (throw (ex-info "--once requires a prompt" {})))
+        "--session" (if-let [path (second remaining)]
+                      (recur (nnext remaining)
+                             (assoc options :session path))
+                      (throw (ex-info "--session requires a path" {})))
+        "--fork" (if-let [path (second remaining)]
+                   (recur (nnext remaining) (assoc options :fork path))
+                   (throw (ex-info "--fork requires a destination" {})))
+        "--compact" (recur (next remaining) (assoc options :compact true))
+        "--session-info"
+        (recur (next remaining) (assoc options :session-info true))
+        "--provider" (if-let [id (second remaining)]
+                       (recur (nnext remaining)
+                              (assoc options :provider (keyword id)))
+                       (throw (ex-info "--provider requires an id" {})))
+        "--mode" (if-let [mode (second remaining)]
+                   (let [value (keyword mode)]
+                     (when-not (contains? #{:print :json :rpc :tui} value)
+                       (throw (ex-info "--mode must be print, tui, json, or rpc"
+                                       {:mode mode})))
+                     (recur (nnext remaining) (assoc options :mode value)))
+                   (throw (ex-info "--mode requires a value" {})))
+        "--list" (recur (next remaining) (assoc options :list true))
+        "--help" (assoc options :help true)
+        "-h" (assoc options :help true)
+        (throw (ex-info (str "Unknown argument: " argument) {})))
+      options)))
+
+(defn- with-session-path [config path]
+  (if-not path
+    config
+    (let [plugins (:plugins config)
+          index (session-plugin-index plugins)]
+      (when-not index
+        (throw (ex-info "Profile has no session plugin to configure" {})))
+      (assoc-in config [:plugins index :config :path] path))))
+
+(defn ensure-tui-session-path
+  "Give interactive TUI sessions a recoverable default JSONL path.
+
+  Set `:ephemeral true` on the session plugin to explicitly opt out."
+  [config]
+  (let [plugins (:plugins config)
+        index (session-plugin-index plugins)]
+    (when-not index
+      (throw (ex-info "Profile has no session plugin to configure" {})))
+    (let [session-config (get-in config [:plugins index :config])]
+      (if (or (:ephemeral session-config) (:path session-config))
+        config
+        (let [timestamp (.format
+                         (java.time.format.DateTimeFormatter/ofPattern
+                          "yyyyMMdd-HHmmss")
+                         (java.time.LocalDateTime/now))
+              suffix (subs (str (random-uuid)) 0 8)]
+          (assoc-in config [:plugins index :config :path]
+                    (str ".bb-agent/sessions/" timestamp "-" suffix
+                         ".jsonl")))))))
+
+(defn- for-mode [config mode]
+  (update config :plugins
+          (fn [plugins]
+            (->> plugins
+                 (remove #(and (contains? #{:json :rpc :tui} mode)
+                               (= 'agent.plugins.stream-console (:ns %))))
+                 (remove #(and (= :tui mode)
+                               (= 'agent.plugins.trace (:ns %))))
+                 (remove #(and (not= :tui mode)
+                               (= 'agent.plugins.tui (:ns %))))
+                 vec))))
+
+(defn- print-inventory [ctx]
+  (println "Plugins:")
+  (doseq [{:keys [id description]} (kernel/loaded-plugins ctx)]
+    (println " " id "-" description))
+  (println "Tools:")
+  (doseq [{:keys [name description]} (kernel/tools ctx)]
+    (println " " name "-" description))
+  (println "Commands:")
+  (doseq [{:keys [name description]} (command/commands ctx)]
+    (println (str " /" name " - " description))))
+
+(defn- run-and-print! [ctx run prompt]
+  (when-let [streaming (kernel/service ctx :output/streaming)]
+    ((:reset! streaming)))
+  (let [result (run prompt)
+        streaming (kernel/service ctx :output/streaming)
+        streamed? (and streaming ((:printed? streaming)))]
+    (when-not streamed?
+      (println (:content result)))
+    result))
+
+(defn- session-info [store]
+  {:session-id (:session-id store)
+   :path (:path store)
+   :event-count (count ((:events store)))
+   :message-count (count ((:messages store)))
+   :diagnostics ((:diagnostics store))})
+
+(defn- interactive! [ctx]
+  (let [agent-session (kernel/require-service ctx :agent/session)
+        store (kernel/require-service ctx :session/store)
+        tasks (atom #{})
+        submit!
+        (fn [message]
+          (when-let [streaming (kernel/service ctx :output/streaming)]
+            ((:reset! streaming)))
+          (let [{:keys [task result]} ((:submit! agent-session) message)]
+            (swap! tasks conj task)
+            (future
+              (let [{:keys [ok value error]} @result
+                    streaming (kernel/service ctx :output/streaming)
+                    streamed? (and streaming ((:printed? streaming)))]
+                (if ok
+                  (when-not streamed? (println (:content value)))
+                  (binding [*out* *err*]
+                    (println "Error:" (ex-message error))))
+                (swap! tasks disj task)
+                (print "agent> ")
+                (flush)))))]
+    (println "Commands: /commands lists all available commands")
+    (loop []
+      (print "agent> ")
+      (flush)
+      (when-let [line (read-line)]
+        (let [command (str/trim line)]
+          (if (str/starts-with? command "/")
+            (let [{:keys [quit? output error]} (command/dispatch! ctx command)]
+              (cond
+                quit? (do
+                        ((:abort! agent-session))
+                        (doseq [task @tasks] (deref task 1000 nil))
+                        nil)
+                :else (do
+                        (when error (println error))
+                        (when (some? output)
+                          (println (if (string? output) output (pr-str output))))
+                        (recur))))
+            (do
+              (when-not (str/blank? line)
+                (try
+                  (if (= :idle (:phase ((:state agent-session))))
+                    (submit! line)
+                    (do
+                      ((:follow-up! agent-session) line)
+                      (println "Follow-up queued.")))
+                  (catch Throwable error
+                    (binding [*out* *err*]
+                      (println "Error:" (ex-message error))))))
+              (recur))))))))
+
+(defn- run-tui! [config provider allow-external-plugins]
+  (loop [next-config config
+         next-provider provider]
+    (let [ctx (plugin/boot! next-config
+                            {:allow-external-plugins
+                             allow-external-plugins})
+          outcome
+          (try
+            (when next-provider
+              ((:select! (kernel/require-service ctx :llm/registry))
+               next-provider))
+            (if-let [frontend (kernel/service ctx :frontend/interactive)]
+              ((:run! frontend))
+              (do (interactive! ctx) nil))
+            (finally
+              (kernel/dispose-all! ctx)))]
+      (when-let [path (:next-session outcome)]
+        (recur (with-session-path config path)
+               (or (:next-provider outcome) next-provider))))))
+
+(defn -main [& args]
+  (let [{profile-path :config
+         session-info? :session-info
+         :keys [prompt list help session fork compact provider mode]}
+        (parse-args args)]
+    (if help
+      (println usage)
+      (let [mode (or mode (if prompt :print :tui))
+            _ (when (and (= :tui mode) prompt)
+                (throw
+                 (ex-info
+                  "TUI mode does not accept --once; omit --once to open the TUI"
+                  {})))
+            interactive-tui?
+            (and (= :tui mode)
+                 (not (or list fork compact session-info? prompt)))
+            config (-> (plugin/read-config profile-path)
+                       (with-session-path session)
+                       (for-mode mode)
+                       (cond-> interactive-tui? ensure-tui-session-path))
+            allow-external-plugins (trust/trusted-root? ".")]
+        (if interactive-tui?
+          (run-tui! config provider allow-external-plugins)
+          (let [ctx (plugin/boot! config
+                                  {:allow-external-plugins
+                                   allow-external-plugins})]
+            (try
+              (when provider
+                ((:select! (kernel/require-service ctx :llm/registry))
+                 provider))
+              (let [store (kernel/require-service ctx :session/store)]
+                (cond
+                  list (print-inventory ctx)
+                  fork (println (pr-str ((:fork! store) fork)))
+                  compact (println (pr-str ((:compact! store))))
+                  session-info? (println (pr-str (session-info store)))
+                  (= :rpc mode) (protocol/rpc! ctx)
+                  (= :json mode)
+                  (if prompt
+                    (protocol/json-once! ctx prompt)
+                    (throw (ex-info "JSON mode requires --once PROMPT" {})))
+                  prompt (run-and-print!
+                          ctx (kernel/require-service ctx :agent/run) prompt)
+                  :else (interactive! ctx)))
+              (finally
+                (kernel/dispose-all! ctx)))))))))
+
+(defn entrypoint
+  "Command-line boundary with concise user-facing failures.
+
+  Embedders should continue to call `-main` or `agent.api`; only this process
+  boundary exits the JVM. Set BB_AGENT_DEBUG=1 to include a stack trace."
+  [& args]
+  (try
+    (apply -main args)
+    (catch Throwable error
+      (binding [*out* *err*]
+        (println "Error:" (or (ex-message error) (str error)))
+        (when (= "1" (System/getenv "BB_AGENT_DEBUG"))
+          (.printStackTrace error *err*)))
+      (System/exit 1))))

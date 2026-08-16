@@ -1,0 +1,36 @@
+# Agent runtime state: conversations, tool calls, local paths, and sandboxes
+.bb-agent/
+.bb-agent-*
+
+# Local credentials and environment overrides
+.env
+.env.*
+!.env.example
+.codex/
+auth.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.secret
+*.local
+
+# Generated, cache, and test output
+target/
+out/
+coverage/
+.cache/
+.cpcache/
+.lsp/
+.nrepl-port
+tmp/
+temp/
+*.log
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

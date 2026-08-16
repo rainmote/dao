@@ -1,0 +1,9 @@
+{:paths ["src" "plugins"]
+ :tasks
+ {agent {:doc "Run the plugin-based LLM agent"
+         :requires ([agent.cli :as cli])
+         :task (apply cli/entrypoint *command-line-args*)}
+  test {:doc "Run the test suite"
+        :extra-paths ["test"]
+        :requires ([agent.test-runner :as test-runner])
+        :task (test-runner/-main)}}}

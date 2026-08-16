@@ -1,0 +1,14 @@
+{:plugins
+ [{:ns agent.plugins.session}
+  {:ns agent.plugins.mock
+   :config
+   {:responses
+    [{:message {:role "assistant"
+                :content "TUI is ready. Ctrl+N inserts a newline; Enter submits."}
+      :finish-reason "stop"
+      :usage {:total_tokens 12}}]}}
+  {:ns agent.plugins.runtime
+   :config {:max-steps 3
+            :system-prompt "Reply briefly for the offline TUI demo."}}
+  {:ns agent.plugins.tui
+   :config {:root "." :screen :alternate :theme :midnight}}]}

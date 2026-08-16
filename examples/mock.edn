@@ -1,0 +1,24 @@
+{:plugins
+ [{:ns agent.plugins.session}
+  {:ns agent.plugins.mock
+   :config
+   {:responses
+    [{:message
+      {:role "assistant"
+       :content nil
+       :tool_calls
+       [{:id "call-demo-1"
+         :type "function"
+         :function {:name "calculate"
+                    :arguments "{\"operation\":\"multiply\",\"a\":6,\"b\":7}"}}]}
+      :finish-reason "tool_calls"
+      :usage {:prompt_tokens 20 :completion_tokens 10 :total_tokens 30}}
+     {:message {:role "assistant"
+                :content "6 × 7 = 42。"}
+      :finish-reason "stop"
+      :usage {:prompt_tokens 35 :completion_tokens 8 :total_tokens 43}}]}}
+  {:ns agent.plugins.math}
+  {:ns agent.plugins.trace :config {:enabled true}}
+  {:ns agent.plugins.runtime
+   :config {:max-steps 4
+            :system-prompt "Use the calculator when arithmetic is requested."}}]}
