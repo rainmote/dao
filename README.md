@@ -46,6 +46,19 @@ bb agent --once "读取 README.md 并总结这个项目"
 已读范围、总行数和下一次应使用的 `offset`。其中写入、编辑、shell 和 `bb_repl` 必须先
 通过用户 trust store 与 approval；只读工具不要求把项目标为可信。
 
+默认 profile 还加载 OMP-inspired coding foundation 插件：`hash_read` 为完整文件生成
+内容哈希快照和逐行锚点，`hash_edit` 用这些锚点批量修改并拒绝过期、错位或互相重叠的
+编辑。它不会替换原来的 `edit`；非复杂小改仍可继续使用精确字符串替换。插件同时提供
+`/role`，可把 `default/plan/slow/smol/advisor` 角色映射到不同 provider，配置和安全边界见
+[OMP 插件文档](docs/omp-plugin.md)。
+
+默认 profile 也启用了 DeepSeek Harness 风格的 subagent 插件族：`delegate_task` 创建完全
+独立的子会话，`fork_agent` 只继承已经闭合的父会话轮次；两者支持 persona、只读工具收窄、
+结构化输出以及前台/后台运行。后台任务通过 `list_agents`、`wait_agent`、
+`interrupt_agent` 管理。同一批 sibling 委派可并行，但结果仍按原 tool-call 顺序回写。
+子代理默认不能写文件或执行 shell，完整架构、配置和当前范围见
+[Subagent 插件文档](docs/subagent-plugin.md)。
+
 切换到 DeepSeek：
 
 ```bash
@@ -278,6 +291,9 @@ src/agent/plugins/runtime.clj   默认 agent loop 插件
 src/agent/plugins/execution_world.clj 统一文件与进程执行世界
 src/agent/plugins/context_manager.clj token 预算、语义压缩与恢复重试
 src/agent/plugins/model_registry.clj 多 provider/model 目录与选择器
+src/agent/plugins/subagent.clj provider-neutral subagent registry 与生命周期
+src/agent/plugins/subagent_in_process.clj 隔离的 spawn/fork provider
+src/agent/plugins/subagent_tools.clj 委派与后台任务控制工具
 src/agent/plugins/resources.clj 可信 context/prompt/skill 发现与 reload
 src/agent/plugins/bb_repl.clj   持久化 Babashka 子进程 provider
 src/agent/plugins/clojure_repl.clj 模型侧 bb_repl 工具

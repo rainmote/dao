@@ -26,6 +26,54 @@
   {:ns agent.plugins.tools
    :config {:max-read-chars 50000}}
 
+  {:ns agent.plugins.omp
+   :config {:max-file-chars 500000
+            :max-edits 32
+            :default-role :default
+            ;; Values may also be fallback vectors, for example
+            ;; :plan [:anthropic :chatgpt]. Only registered providers are used.
+            :roles {:default :chatgpt}}}
+
+  ;; DeepSeek Harness-style subagents are split into a provider-neutral
+  ;; registry, isolated spawn/fork providers, and model-facing tool adapters.
+  {:ns agent.plugins.subagent}
+
+  {:ns agent.plugins.subagent-in-process
+   :config
+   {:max-depth 1
+    ;; A request may narrow this set but can never expand it. Mutating and
+    ;; process tools remain unavailable to unattended child agents.
+    :allowed-tools ["current_time" "read" "read_file" "ls" "find" "grep"]
+    :child-profile
+    {:plugins
+     [{:ns agent.plugins.session :config {:path nil :ephemeral true}}
+      {:ns agent.plugins.model-registry
+       :config {:default-provider :chatgpt}}
+      {:ns agent.plugins.chatgpt
+       :config {:model "gpt-5.6-sol"
+                :timeout-ms 180000
+                :connect-timeout-ms 15000
+                :http-version :http1.1
+                :transport-retries 4
+                :retry-delay-ms 400
+                :extra-body {:reasoning {:effort "medium"}}}}
+      {:ns agent.plugins.execution-world
+       :config {:root "."
+                :timeout-ms 30000
+                :max-output-chars 50000}}
+      {:ns agent.plugins.tools
+       :config {:max-read-chars 50000}}
+      {:ns agent.plugins.context-manager
+       :config {:context-window 128000
+                :reserve-tokens 16384
+                :retain-messages 12}}
+      {:ns agent.plugins.runtime
+       :config {:max-steps 8
+                :system-prompt
+                "You are an isolated research subagent. Complete the delegated task with the available read-only tools, report concrete evidence, and do not claim to have changed files."}}]}}}
+
+  {:ns agent.plugins.subagent-tools}
+
   {:ns agent.plugins.bb-repl
    :config {:root "."
             :sandbox :auto
@@ -46,8 +94,8 @@
 
   {:ns agent.plugins.policy
    :config {:deny-tools []
-            :trusted-tools ["write" "edit" "bash" "bb_repl"]
-            :approval-tools ["write" "edit" "bash" "bb_repl"]}}
+            :trusted-tools ["write" "edit" "hash_edit" "bash" "bb_repl"]
+            :approval-tools ["write" "edit" "hash_edit" "bash" "bb_repl"]}}
 
   {:ns agent.plugins.trace
    :config {:enabled true
@@ -63,7 +111,7 @@
   {:ns agent.plugins.runtime
    :config {:max-steps 12
             :system-prompt
-            "You are a concise coding assistant. Use read, write, edit, bash, grep, find, and ls to work accurately in the project. Use bb_repl for exact calculations and Clojure data transformations. Never invent tool results."}}
+            "You are a concise coding assistant. Use read, write, edit, bash, grep, find, and ls to work accurately in the project. For non-trivial or concurrently changing files, prefer hash_read followed by one hash_edit batch; always run hash_read again before a later hash_edit on the same file. Use bb_repl for exact calculations and Clojure data transformations. Never invent tool results."}}
 
   {:ns agent.plugins.tui
    :config {:root "."

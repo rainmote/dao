@@ -9,7 +9,11 @@
             [agent.sandbox :as sandbox]
             [agent.ui :as ui]
             [agent.plugins.chatgpt]
+            [agent.plugins.omp]
             [agent.plugins.openai]
+            [agent.plugins.subagent]
+            [agent.plugins.subagent-in-process]
+            [agent.plugins.subagent-tools]
             [agent.plugins.trust :as trust]
             [agent.plugins.tui :as tui]
             [agent.schema :as schema]
@@ -1165,6 +1169,127 @@
   {:id id :type "function"
    :function {:name name :arguments (json/generate-string arguments)}})
 
+(defn- subagent-test-context
+  ([generate] (subagent-test-context generate #{}))
+  ([generate allowed-tools]
+   (plugin/boot!
+    {:plugins
+     [{:ns 'agent.plugins.session}
+      {:ns 'agent.plugins.subagent}
+      {:ns 'agent.plugins.subagent-in-process
+       :config
+       {:allowed-tools allowed-tools
+        :child-profile
+        {:plugins
+         [{:ns 'agent.plugins.session}
+          {:ns 'agent.plugins.mock :config {:generate generate}}
+          {:ns 'example.math}
+          {:ns 'agent.plugins.runtime :config {:max-steps 3}}]}}}
+      {:ns 'agent.plugins.subagent-tools}]})))
+
+(deftest subagent-providers-are-isolated-capability-checked-and-structured
+  (let [request-seen (promise)
+        ctx (subagent-test-context
+             (fn [request]
+               (deliver request-seen request)
+               {:message {:role "assistant" :content "{\"answer\":42}"}
+                :finish-reason "stop"})
+             #{"calculate"})]
+    (try
+      (let [runtime (kernel/require-service ctx :subagents/runtime)
+            delegate (kernel/tool ctx "delegate_task")
+            result ((:execute delegate)
+                    {:prompt "Return the answer"
+                     :persona "You are a terse verifier."
+                     :tool_filter ["calculate"]
+                     :output_schema
+                     {:type "object"
+                      :required ["answer"]
+                      :properties {"answer" {:type "integer"}}
+                      :additionalProperties false}}
+                    {:cancel-token (cancellation/create-token)})
+            request (deref request-seen 1000 :timeout)]
+        (is (= :completed (:stop-reason result)))
+        (is (= {:answer 42} (:structured result)))
+        (is (str/includes? (:system-prompt request) "terse verifier"))
+        (is (= ["calculate"]
+               (mapv #(get-in % [:function :name]) (:tools request))))
+        (is (empty? ((:jobs runtime))))
+        (is (= #{:spawn :fork}
+               (set (map :id ((:providers runtime))))))
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo
+             #"not registered"
+             ((:start! runtime) {:provider :missing :prompt "x"})))
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo
+             #"depth limit"
+             ((:start! runtime) {:provider :spawn :prompt "x"
+                                 :parent-depth 1}))))
+      (finally (kernel/dispose-all! ctx)))))
+
+(deftest fork-agent-seeds-only-completed-parent-turns
+  (let [request-seen (promise)
+        ctx (subagent-test-context
+             (fn [request]
+               (deliver request-seen request)
+               {:message {:role "assistant" :content "forked"}
+                :finish-reason "stop"}))]
+    (try
+      (let [store (kernel/require-service ctx :session/store)]
+        ((:append! store) "message"
+         {:message {:role "user" :content "completed user"}})
+        ((:append! store) "message"
+         {:message {:role "assistant" :content "completed assistant"}})
+        ((:append! store) "step/end" {:step 1 :tool-count 0})
+        ((:append! store) "session/compaction"
+         {:original_message_count 2
+          :retained_message_count 1
+          :replacement_messages
+          [{:role "system" :content "completed summary"}]})
+        ((:append! store) "message"
+         {:message {:role "user" :content "open user"}})
+        ((:append! store) "step/start" {:step 2})
+        (let [fork (kernel/tool ctx "fork_agent")
+              result ((:execute fork) {:prompt "child prompt"}
+                      {:cancel-token (cancellation/create-token)})
+              request (deref request-seen 1000 :timeout)
+              contents (mapv :content (:messages request))]
+          (is (= :completed (:stop-reason result)))
+          (is (= ["completed summary" "child prompt"]
+                 contents))
+          (is (not-any? #{"open user"} contents))))
+      (finally (kernel/dispose-all! ctx)))))
+
+(deftest background-subagent-can-be-listed-interrupted-and-collected
+  (let [started (promise)
+        ctx (subagent-test-context
+             (fn [{:keys [cancel-token]}]
+               (deliver started true)
+               (loop []
+                 (cancellation/throw-if-cancelled! cancel-token)
+                 (Thread/sleep 10)
+                 (recur))))]
+    (try
+      (let [delegate (kernel/tool ctx "delegate_task")
+            list-agents (kernel/tool ctx "list_agents")
+            interrupt (kernel/tool ctx "interrupt_agent")
+            wait-agent (kernel/tool ctx "wait_agent")
+            job ((:execute delegate)
+                 {:prompt "keep working" :run_in_background true}
+                 {:cancel-token (cancellation/create-token)})
+            run-id (:id job)]
+        (is (= true (deref started 1000 :timeout)))
+        (is (= [run-id]
+               (mapv :id (:agents ((:execute list-agents) {} {})))))
+        (is (true? (:interrupted
+                    ((:execute interrupt) {:id run-id} {}))))
+        (is (= :aborted
+               (:stop-reason
+                ((:execute wait-agent) {:id run-id :timeout_ms 1000} {}))))
+        (is (empty? (:agents ((:execute list-agents) {} {})))))
+      (finally (kernel/dispose-all! ctx)))))
+
 (deftest controllable-agent-session-steers-follows-up-and-aborts
   (testing "steering enters before the next model request and follow-up waits"
     (let [started (promise)
@@ -1771,6 +1896,116 @@
         (dispose-b)
         (dispose-a))
       (finally (kernel/dispose-all! ctx)))))
+
+(deftest omp-anchored-edits-reject-stale-and-overlapping-work
+  (let [directory (.toFile (java.nio.file.Files/createTempDirectory
+                            "bb-agent-omp-edit-"
+                            (make-array java.nio.file.attribute.FileAttribute
+                                        0)))
+        target (io/file directory "sample.txt")]
+    (spit target "one\ntwo\nthree\n")
+    (try
+      (let [ctx (plugin/boot!
+                 {:plugins
+                  [{:ns 'agent.plugins.model-registry}
+                   {:ns 'agent.plugins.execution-world
+                    :config {:root (str directory) :sandbox :none}}
+                   {:ns 'agent.plugins.omp
+                    :config {:max-file-chars 10000 :max-edits 8}}]})]
+        (try
+          (let [read-tool (kernel/tool ctx "hash_read")
+                edit-tool (kernel/tool ctx "hash_edit")
+                first-read ((:execute read-tool) {:path "sample.txt"} {})
+                anchors (mapv :anchor (:lines first-read))
+                edited ((:execute edit-tool)
+                        {:path "sample.txt"
+                         :file_hash (:file_hash first-read)
+                         :edits [{:op "replace"
+                                  :start (anchors 1)
+                                  :content "TWO"}
+                                 {:op "insert_after"
+                                  :start (anchors 2)
+                                  :content "four"}]}
+                        {})]
+            (is (= "one\nTWO\nthree\nfour\n" (slurp target)))
+            (is (= 2 (:edits edited)))
+            (is (not= (:file_hash first-read) (:file_hash edited)))
+            (is (thrown-with-msg?
+                 clojure.lang.ExceptionInfo
+                 #"hash_read"
+                 ((:execute edit-tool)
+                  {:path "sample.txt"
+                   :file_hash (:file_hash first-read)
+                   :edits [{:op "delete" :start (anchors 0)}]}
+                  {})))
+            (let [latest ((:execute read-tool) {:path "sample.txt"} {})
+                  first-anchor (get-in latest [:lines 0 :anchor])]
+              (is (thrown-with-msg?
+                   clojure.lang.ExceptionInfo
+                   #"overlap"
+                   ((:execute edit-tool)
+                    {:path "sample.txt"
+                     :file_hash (:file_hash latest)
+                     :edits [{:op "replace" :start first-anchor
+                              :content "ONE"}
+                             {:op "delete" :start first-anchor}]}
+                    {})))
+              (spit target "externally changed\n")
+              (is (thrown-with-msg?
+                   clojure.lang.ExceptionInfo
+                   #"changed after hash_read"
+                   ((:execute edit-tool)
+                    {:path "sample.txt"
+                     :file_hash (:file_hash latest)
+                     :edits [{:op "replace" :start first-anchor
+                              :content "ONE"}]}
+                    {})))
+              (is (= "externally changed\n" (slurp target)))))
+          (finally (kernel/dispose-all! ctx))))
+      (finally (delete-tree! directory)))))
+
+(deftest omp-role-router-selects-a-provider-without-changing-global-selection
+  (let [directory (.toFile (java.nio.file.Files/createTempDirectory
+                            "bb-agent-omp-route-"
+                            (make-array java.nio.file.attribute.FileAttribute
+                                        0)))
+        ctx (plugin/boot!
+             {:plugins
+              [{:ns 'agent.plugins.model-registry}
+               {:ns 'agent.plugins.execution-world
+                :config {:root (str directory) :sandbox :none}}
+               {:ns 'agent.plugins.omp
+                :config {:roles {:default :a :plan [:missing :b]}}}]})]
+    (try
+      (let [registry (kernel/require-service ctx :llm/registry)
+            dispose-a ((:register! registry)
+                       {:id :a :model "a-model"
+                        :generate (fn [_] {:message {:content "a"}})})
+            dispose-b ((:register! registry)
+                       {:id :b :model "b-model"
+                        :generate (fn [_] {:message {:content "b"}})})
+            roles (kernel/require-service ctx :omp/roles)]
+        (try
+          (is (= :a (:id ((:current registry)))))
+          (is (= :plan (:role ((:set! roles) :plan))))
+          (is (= "b"
+                 (get-in (kernel/waterfall
+                          ctx :llm/request
+                          {:messages [] :tools [] :options {}}
+                          (:generate registry))
+                         [:message :content])))
+          (is (= :a (:id ((:current registry)))))
+          (kernel/dispose-plugin! ctx :omp/coding-foundation)
+          (is (nil? (kernel/tool ctx "hash_read")))
+          (is (nil? (kernel/tool ctx "hash_edit")))
+          (is (nil? (kernel/service ctx :omp/roles)))
+          (is (nil? (kernel/command ctx "role")))
+          (finally
+            (dispose-b)
+            (dispose-a))))
+      (finally
+        (kernel/dispose-all! ctx)
+        (delete-tree! directory)))))
 
 (deftest auth-store-resolves-credentials-dynamically
   (let [ctx (plugin/boot! {:plugins [{:ns 'agent.plugins.auth-store}]})]
