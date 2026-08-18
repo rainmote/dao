@@ -23,6 +23,53 @@
             :timeout-ms 30000
             :max-output-chars 50000}}
 
+  {:ns agent.plugins.trust
+   :config {:root "."}}
+
+  ;; Language servers are optional external executables. Missing binaries are
+  ;; reported by /lsp status and never prevent the agent from starting.
+  {:ns agent.plugins.stdio-session
+   :config {:stderr-tail-chars 20000
+            :close-timeout-ms 1000}}
+
+  {:ns agent.plugins.lsp
+   :config
+   {:request-timeout-ms 10000
+    :startup-timeout-ms 30000
+    :max-document-chars 2000000
+    :servers
+    [{:id :clojure-lsp
+      :command "clojure-lsp"
+      :file-types [".clj" ".cljs" ".cljc" ".edn"]
+      :language-id "clojure"
+      :root-markers ["deps.edn" "bb.edn" "project.clj" ".git"]}
+     {:id :rust-analyzer
+      :command "rust-analyzer"
+      :file-types [".rs"]
+      :language-id "rust"
+      :root-markers ["Cargo.toml" "rust-project.json" ".git"]}
+     {:id :clangd
+      :command "clangd"
+      :file-types [".c" ".cc" ".cpp" ".cxx" ".h" ".hh" ".hpp"]
+      :language-id {".c" "c" ".h" "c"
+                    ".cc" "cpp" ".cpp" "cpp" ".cxx" "cpp"
+                    ".hh" "cpp" ".hpp" "cpp"}
+      :root-markers ["compile_commands.json" "compile_flags.txt" ".clangd" ".git"]}
+     {:id :typescript-language-server
+      :command ["typescript-language-server" "--stdio"]
+      :file-types [".ts" ".tsx" ".js" ".jsx" ".mjs" ".cjs"]
+      :language-id {".ts" "typescript" ".tsx" "typescriptreact"
+                    ".js" "javascript" ".jsx" "javascriptreact"
+                    ".mjs" "javascript" ".cjs" "javascript"}
+      :root-markers ["tsconfig.json" "jsconfig.json" "package.json" ".git"]}
+     {:id :pyright
+      :command ["pyright-langserver" "--stdio"]
+      :file-types [".py" ".pyi"]
+      :language-id "python"
+      :root-markers ["pyproject.toml" "setup.py" "requirements.txt" ".git"]}]}}
+
+  {:ns agent.plugins.lsp-tools}
+
   {:ns agent.plugins.tools
    :config {:max-read-chars 50000}}
 
@@ -82,9 +129,6 @@
 
   {:ns agent.plugins.clojure-repl}
 
-  {:ns agent.plugins.trust
-   :config {:root "."}}
-
   {:ns agent.plugins.resources
    :config {:root "."}}
 
@@ -94,7 +138,8 @@
 
   {:ns agent.plugins.policy
    :config {:deny-tools []
-            :trusted-tools ["write" "edit" "hash_edit" "bash" "bb_repl"]
+            :trusted-tools ["write" "edit" "hash_edit" "bash" "bb_repl"
+                            "lsp_query"]
             :approval-tools ["write" "edit" "hash_edit" "bash" "bb_repl"]}}
 
   {:ns agent.plugins.trace
@@ -111,7 +156,7 @@
   {:ns agent.plugins.runtime
    :config {:max-steps 12
             :system-prompt
-            "You are a concise coding assistant. Use read, write, edit, bash, grep, find, and ls to work accurately in the project. For non-trivial or concurrently changing files, prefer hash_read followed by one hash_edit batch; always run hash_read again before a later hash_edit on the same file. Use bb_repl for exact calculations and Clojure data transformations. Never invent tool results."}}
+            "You are a concise coding assistant. Use read, write, edit, bash, grep, find, and ls to work accurately in the project. Use lsp_query for semantic diagnostics, definitions, references, hover, and symbols when a matching language server is available. For non-trivial or concurrently changing files, prefer hash_read followed by one hash_edit batch; always run hash_read again before a later hash_edit on the same file. Use bb_repl for exact calculations and Clojure data transformations. Never invent tool results."}}
 
   {:ns agent.plugins.tui
    :config {:root "."

@@ -59,6 +59,12 @@ bb agent --once "读取 README.md 并总结这个项目"
 子代理默认不能写文件或执行 shell，完整架构、配置和当前范围见
 [Subagent 插件文档](docs/subagent-plugin.md)。
 
+默认 profile 还声明了可选的 LSP server registry，并提供只读 `lsp_query`。它按源文件寻找
+最近项目根、首次查询时才启动服务器，并在每次查询前同步当前文件；支持 diagnostics、
+definition、references、hover、symbols、implementation 与 type definition。没有安装的
+server 只在 `/lsp status` 显示 unavailable，不影响启动，也不会自动下载。配置、协议行为和
+安全范围见 [LSP 插件文档](docs/lsp-plugin.md)。
+
 切换到 DeepSeek：
 
 ```bash
@@ -294,6 +300,9 @@ src/agent/plugins/model_registry.clj 多 provider/model 目录与选择器
 src/agent/plugins/subagent.clj provider-neutral subagent registry 与生命周期
 src/agent/plugins/subagent_in_process.clj 隔离的 spawn/fork provider
 src/agent/plugins/subagent_tools.clj 委派与后台任务控制工具
+src/agent/plugins/stdio_session.clj 长驻、可取消的 argv/stdio 进程 provider
+src/agent/plugins/lsp.clj       LSP registry、JSON-RPC 与文档同步 runtime
+src/agent/plugins/lsp_tools.clj 只读 lsp_query 与 /lsp 命令
 src/agent/plugins/resources.clj 可信 context/prompt/skill 发现与 reload
 src/agent/plugins/bb_repl.clj   持久化 Babashka 子进程 provider
 src/agent/plugins/clojure_repl.clj 模型侧 bb_repl 工具

@@ -18,6 +18,7 @@
             [agent.plugins.tui :as tui]
             [agent.schema :as schema]
             [agent.streaming :as streaming]
+            [babashka.fs :as fs]
             [babashka.http-client :as http]
             [cheshire.core :as json]
             [clojure.edn :as edn]
@@ -2053,6 +2054,102 @@
         (is (= "result" (:type (last lines))))
         (is (some #(= "agent.turn/start" (:event %)) lines)))
       (finally (api/dispose! ctx)))))
+
+(deftest lsp-plugin-contract-and-document-synchronization
+  (let [directory (.toFile
+                   (java.nio.file.Files/createTempDirectory
+                    "bb-agent-lsp-"
+                    (make-array java.nio.file.attribute.FileAttribute 0)))
+        source-directory (io/file directory "src")
+        source-file (io/file source-directory "sample.clj")
+        initial "(defn greet [name]\n  (str \"hello \" name))\n"
+        updated "(defn greet [name]\n  (str \"hi \" name))\n"
+        classpath (str (.getCanonicalPath (io/file "src"))
+                       java.io.File/pathSeparator
+                       (.getCanonicalPath (io/file "test")))
+        bb (str (fs/which "bb"))]
+    (.mkdirs source-directory)
+    (spit (io/file directory "bb.edn") "{}\n")
+    (spit source-file initial)
+    (let [ctx
+          (plugin/boot!
+           {:plugins
+            [{:ns 'agent.plugins.execution-world
+              :config {:root (str directory) :sandbox :none}}
+             {:ns 'agent.plugins.trust
+              :config {:root (str directory) :trusted true}}
+             {:ns 'agent.plugins.stdio-session}
+             {:ns 'agent.plugins.lsp
+              :config
+              {:request-timeout-ms 2000
+               :startup-timeout-ms 5000
+               :failure-cooldown-ms 1000
+               :diagnostic-wait-ms 100
+               :servers
+               [{:id :fake
+                 :command [bb "-cp" classpath "-m" "agent.fake-lsp"]
+                 :file-types [".clj"]
+                 :language-id "clojure"
+                 :root-markers ["bb.edn"]
+                 :settings {:fake {:enabled true}}}]}}
+             {:ns 'agent.plugins.lsp-tools}]})]
+      (try
+        (let [tool (kernel/require-service ctx :lsp/runtime)
+              query! (:query! tool)]
+          (testing "status is lazy and reports executable availability"
+            (let [status (query! {:action "status"} {})]
+              (is (= true (get-in status [:servers 0 :available])))
+              (is (empty? (:clients status)))))
+
+          (testing "initialize handles a colliding server request id"
+            (let [result (query! {:action "definition"
+                                  :file "src/sample.clj"
+                                  :line 1 :symbol "greet"} {})]
+              (is (= "src/sample.clj" (get-in result [:locations 0 :path])))
+              (is (= {:line 1 :column 7}
+                     (get-in result [:locations 0 :range :start])))))
+
+          (testing "pull diagnostics are normalized to one-based positions"
+            (let [result (query! {:action "diagnostics"
+                                  :file "src/sample.clj"} {})]
+              (is (= :pull (:source result)))
+              (is (= {:line 1 :column 1}
+                     (get-in result [:items 0 :range :start])))
+              (is (= (str "chars=" (count initial))
+                     (get-in result [:items 0 :message])))))
+
+          (testing "current disk text is sent before the next query"
+            (spit source-file updated)
+            (let [result (query! {:action "hover"
+                                  :file "src/sample.clj"
+                                  :line 1 :symbol "greet"} {})]
+              (is (str/includes? (get-in result [:hover :contents :value])
+                                 "hi"))))
+
+          (testing "request cancellation returns promptly and sends protocol cancellation"
+            (let [token (cancellation/create-token)
+                  result (future
+                           (try
+                             (query! {:action "references"
+                                      :file "src/sample.clj"
+                                      :line 1 :symbol "greet"}
+                                     {:cancel-token token})
+                             {:unexpected true}
+                             (catch clojure.lang.ExceptionInfo error
+                               (ex-data error))))]
+              (Thread/sleep 30)
+              (cancellation/cancel! token)
+              (is (= true (:cancelled @result)))))
+
+          (testing "reload gracefully removes active clients"
+            ((:reload! tool))
+            (is (empty? (:clients ((:status tool)))))
+            (is (empty? ((:sessions
+                          (kernel/require-service ctx
+                                                  :execution/stdio-session)))))))
+        (finally
+          (kernel/dispose-all! ctx)
+          (delete-tree! directory))))))
 
 (defn -main []
   (let [{:keys [fail error]}

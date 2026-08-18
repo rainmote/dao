@@ -96,13 +96,14 @@ hash，可拦截正常的外部修改；但另一个进程若恰好在“最后�
 
 当前版本没有伪装成已实现以下能力：
 
-- **LSP/DAP**：需要可以保持双向 stdio 会话的受限进程 capability；当前 ExecutionWorld 的
-  `spawn!` 是一次性命令，直接从插件启动语言服务器会绕过项目的 sandbox 设计。
+- **DAP**：需要在现有长驻 stdio provider 上增加调试 session 状态机、事件订阅与单独的
+  交互审批边界；不能把调试器写内存、启动进程等能力混入只读代码查询。
 - **可写 subagent/worktree**：需要子 context、独立 ExecutionWorld 和合并协议，否则并行
   写入会破坏当前确定性的工具批语义。
 - **Advisor 二次调用**：当前 provider 的 stream 是全局事件；在工具内部调用第二个模型会把
   两条流混入前端。应先增加 scoped stream/channel，再实现 Advisor。
 - **Rust 原生搜索与 AST**：属于性能后端，不应在 Babashka 插件中复制伪实现。
 
-推荐的下一阶段是先扩展 ExecutionWorld：增加受限、可取消、双向的 `open-session!`，再在其上
-分别实现 LSP 与 DAP transport 插件。
+LSP 已由独立的 stdio provider、runtime 和 tool adapter 实现，见
+[LSP 插件文档](lsp-plugin.md)。下一阶段可在同一 provider 上单独实现 DAP transport，仍不需要
+修改 OMP coding foundation 本身。
