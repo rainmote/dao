@@ -6,4 +6,6 @@
   test {:doc "Run the test suite"
         :extra-paths ["test"]
         :requires ([agent.test-runner :as test-runner])
-        :task (test-runner/-main)}}}
+        :task (test-runner/-main)}
+  web {:doc "Build and start the local WebUI"
+       :task (shell "npm run web")}}}

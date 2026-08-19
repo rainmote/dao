@@ -85,7 +85,7 @@ tool-call loop、JSON mode、RPC ready/state/shutdown 和真实 PTY 下的 TUI �
 | 运行时模型控制 | `/model`、provider/model 切换、thinking level、费用和 token 信息 | `/model`、`--provider`、RPC select；metadata 含 context/thinking/modalities | 已具备选择；费用展示待补 |
 | Extension API | 工具、provider、命令、flag、快捷键、renderer、UI、全生命周期事件 | reversible tool/service/command/observer/interceptor/provider/UI registry | 主要能力已具备；CLI flag registry 待补 |
 | 资源发现与 reload | user/project 自动发现，trust 后加载，`/reload` 刷新全部资源 | trust 后发现用户/项目资源并原子 reload catalog | 部分；整棵 plugin fiber reload 待补 |
-| Skill / prompt / context | Agent Skills progressive disclosure、prompt template、AGENTS.md、SYSTEM.md | metadata 注入 + `load_skill`，发现 AGENTS/SYSTEM/prompt | 已具备 |
+| Skill / prompt / context | Agent Skills progressive disclosure、prompt template、AGENTS.md、SYSTEM.md | YAML metadata、`skill://` 资源、slash command、筛选/去重、子 Agent 继承及 AGENTS/SYSTEM/prompt | 已具备主路径；多生态 provider 待补 |
 | 包管理 | npm/git/local package，过滤、启停、更新、项目级安装 | 依赖 Babashka classpath 和手工 profile | 缺失，P2 |
 | TUI | 多行编辑器、快捷键、命令、主题、工具 renderer、session/model selector | JLine 全屏插件；流式 Markdown、工具折叠、补全、审批 overlay、selector、主题及 UI registry | 已具备主路径；图片与费用 UI 待补 |
 | Headless / SDK | print、JSON event stream、stdin/stdout RPC、TypeScript SDK | version 1 JSONL、stdin/stdout RPC、公开 `agent.api` | 已具备（Clojure API，无 TS SDK） |
@@ -202,9 +202,9 @@ catalog 以 no-follow 目录遍历索引 id、父 session、名称、标签、�
 
 独立 `:resources/catalog` 插件已经统一发现：
 
-- `~/.bb-agent/` 用户级与 `.bb-agent/` 项目级资源；
+- `~/.bb-agent/`、`~/.agents/skills/` 用户级与 `.bb-agent/` 项目级资源；
 - `AGENTS.md`、`SYSTEM.md`、prompt template；
-- `SKILL.md`，启动时只注入 name/description，命中后再读取全文；
+- `SKILL.md`，启动时只注入 metadata，命中后通过 `skill://` 读取全文和同目录资源；
 - 资源来源、scope 和 trust 状态。
 
 catalog reload 会先扫描并验证完整新快照，再原子切换 context/prompt/skill。项目外置 plugin

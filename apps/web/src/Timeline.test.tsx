@@ -1,0 +1,42 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { buildToolBatches, operationTarget } from "./Timeline";
+import type { DurableEvent } from "./types";
+
+function event(id: string, type: string, data: Record<string, unknown> = {}): DurableEvent {
+  return { id, type, data, seq: Number(id.replace(/\D/g, "")) || 1, at: "2026-08-19T00:00:00Z" };
+}
+
+test("groups all tool calls from the same runtime step", () => {
+  const events = [
+    event("step1", "step/start", { step: 1 }),
+    event("call1", "tool/call", { name: "read", "call-id": "a", arguments: { path: "README.md" } }),
+    event("approval1", "approval/decision", { decision: "allow" }),
+    event("call2", "tool/call", { name: "grep", "call-id": "b", arguments: { query: "TODO" } }),
+    event("result1", "tool/result", { "call-id": "a", ok: true }),
+    event("result2", "tool/result", { "call-id": "b", ok: true }),
+    event("stepend1", "step/end", { step: 1 }),
+    event("step2", "step/start", { step: 2 }),
+    event("call3", "tool/call", { name: "bash", "call-id": "c", arguments: { command: "npm test" } }),
+    event("stepend2", "step/end", { step: 2 }),
+  ];
+  const grouped = buildToolBatches(events);
+
+  assert.deepEqual(grouped.batches.get("call1")?.calls.map(({ id }) => id), ["call1", "call2"]);
+  assert.equal(grouped.groupedCallIds.has("call2"), true);
+  assert.deepEqual(grouped.batches.get("call3")?.calls.map(({ id }) => id), ["call3"]);
+});
+
+test("describes and truncates tool operation targets", () => {
+  const bash = event("call1", "tool/call", {
+    name: "bash",
+    arguments: { cwd: "apps/web", command: "npm run a-very-long-command-name" },
+  });
+  const grep = event("call2", "tool/call", {
+    name: "grep",
+    arguments: { path: "src", query: "tool_calls" },
+  });
+
+  assert.equal(operationTarget(grep), "src · tool_calls");
+  assert.equal(operationTarget(bash, 20), "apps/web · npm run …");
+});

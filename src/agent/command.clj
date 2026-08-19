@@ -26,8 +26,16 @@
    {:name "theme" :description "Show or select the TUI theme."}
    {:name "quit" :description "Exit the interactive frontend."}])
 
+(defn- skill-commands [ctx]
+  (if-let [resources (kernel/service ctx :resources/catalog)]
+    (mapv (fn [{:keys [name description]}]
+            {:name (str "skill:" name)
+             :description description})
+          ((:skill-commands resources)))
+    []))
+
 (defn commands [ctx]
-  (->> (concat built-ins (kernel/commands ctx))
+  (->> (concat built-ins (kernel/commands ctx) (skill-commands ctx))
        (reduce (fn [by-name command]
                  (assoc by-name (:name command)
                         (select-keys command [:name :description])))
@@ -70,6 +78,25 @@
     {:handled true
      :error (str "Trust is fixed by this profile's :trusted override; "
                  "remove that override to use the user trust store.")}))
+
+(defn- invoke-skill! [ctx session command-name argument]
+  (try
+    (if-let [resources (kernel/service ctx :resources/catalog)]
+      (if-not ((:skill-commands-enabled? resources))
+        {:handled true :error "Skill commands are disabled."}
+        (let [skill-name (subs command-name (count "skill:"))
+              prompt ((:render-skill-invocation resources) skill-name argument)
+              active? (not= :idle (:phase ((:state session))))]
+          (if active?
+            (do
+              ((:steer! session) prompt)
+              (output {:skill skill-name :status :steered}))
+            (do
+              ((:submit! session) prompt)
+              (output {:skill skill-name :status :submitted})))))
+      (output "No resource catalog is configured."))
+    (catch Throwable error
+      {:handled true :error (ex-message error)})))
 
 (defn dispatch!
   "Execute a slash command and return a frontend-neutral result map.
@@ -131,9 +158,15 @@
         "clear" (do ((:clear! store)) (output {:cleared true}))
         "theme" {:handled true :ui :theme-selector
                    :theme (when-not (str/blank? argument) (keyword argument))}
-        (if-let [registered (kernel/command ctx name)]
-          (output ((:execute registered)
-                   argument
-                   {:context ctx :session session :store store}))
-          {:handled true :error (str "Unknown command: /" name)})))
+        (cond
+          (str/starts-with? name "skill:")
+          (invoke-skill! ctx session name argument)
+
+          (kernel/command ctx name)
+          (let [registered (kernel/command ctx name)]
+            (output ((:execute registered)
+                     argument
+                     {:context ctx :session session :store store})))
+
+          :else {:handled true :error (str "Unknown command: /" name)})))
     {:handled false}))

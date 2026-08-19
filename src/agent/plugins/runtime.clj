@@ -3,6 +3,7 @@
   (:require [agent.cancellation :as cancellation]
             [agent.kernel :as kernel]
             [agent.schema :as schema]
+            [agent.system-prompt :as system]
             [cheshire.core :as json]
             [clojure.string :as str]))
 
@@ -19,10 +20,34 @@
 (defn- messages [ctx]
   ((:messages (kernel/require-service ctx :session/store))))
 
-(defn- system-prompt [ctx configured]
-  (if-let [resources (kernel/service ctx :resources/catalog)]
-    (str (or configured "") ((:render-prompt resources)))
-    configured))
+(defn- nonblank-string [value]
+  (when (and (string? value) (not (str/blank? value))) value))
+
+(defn- base-system-prompt [{:keys [system-prompt system-prompt-template]}]
+  (case system-prompt-template
+    nil system-prompt
+    :omp @system/omp-template
+    (throw (ex-info "Unknown system prompt template"
+                    {:template system-prompt-template}))))
+
+(defn- system-prompt [ctx config]
+  (let [resources (kernel/service ctx :resources/catalog)
+        snapshot (when resources
+                   ((or (:prompt-snapshot resources) (:snapshot resources))))
+        custom (or (nonblank-string (:custom-system-prompt config))
+                   (get-in snapshot [:system-prompt :content]))
+        append-prompt (or (nonblank-string (:append-system-prompt config))
+                          (get-in snapshot [:append-system-prompt :content]))]
+    (system/assemble
+     {:base-prompt (base-system-prompt config)
+      :custom-prompt custom
+      :append-prompt append-prompt
+      :contexts (:contexts snapshot)
+      :skills (or (:model-skills snapshot) (:skills snapshot))
+      :tool-names (when resources (mapv :name (kernel/tools ctx)))
+      :workspace (:workspace snapshot)
+      :local-date (when resources (str (java.time.LocalDate/now)))
+      :project-trusted (:project-trusted snapshot)})))
 
 (defn- blank-content? [content]
   (or (nil? content)
@@ -390,7 +415,7 @@
       (inject-queued! ctx queue listeners :steer)
       (record! ctx "step/start" {:step step})
       (publish! ctx listeners :agent.turn/start {:step step})
-      (let [request {:system-prompt (system-prompt ctx (:system-prompt config))
+      (let [request {:system-prompt (system-prompt ctx config)
                      :messages (messages ctx)
                      :tools (kernel/tool-schemas ctx)
                      :cancel-token cancel-token

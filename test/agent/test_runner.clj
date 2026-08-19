@@ -8,6 +8,7 @@
             [agent.protocol :as protocol]
             [agent.sandbox :as sandbox]
             [agent.ui :as ui]
+            [agent.web-test]
             [agent.plugins.chatgpt]
             [agent.plugins.omp]
             [agent.plugins.openai]
@@ -18,6 +19,7 @@
             [agent.plugins.tui :as tui]
             [agent.schema :as schema]
             [agent.streaming :as streaming]
+            [agent.system-prompt :as system-prompt]
             [babashka.fs :as fs]
             [babashka.http-client :as http]
             [cheshire.core :as json]
@@ -1849,6 +1851,13 @@
             (spit skill-file
                   "---\nname: demo-skill\ndescription: Updated\n---\nNew body.")
             (is (= "Updated" (get-in ((:reload! catalog))
+                                      [:skills 0 :description])))
+            (spit skill-file
+                  (str "---\nname: demo-skill\ndescription: Updated\n"
+                       "globs: not-an-array\n---\nBroken"))
+            (is (thrown-with-msg? clojure.lang.ExceptionInfo #"globs"
+                                  ((:reload! catalog))))
+            (is (= "Updated" (get-in ((:snapshot catalog))
                                       [:skills 0 :description]))))
           (finally (kernel/dispose-all! ctx))))
       (let [ctx (plugin/boot!
@@ -1863,6 +1872,289 @@
                                       ctx :resources/catalog)))]
             (is (empty? (:contexts snapshot)))
             (is (empty? (:skills snapshot))))
+          (finally (kernel/dispose-all! ctx))))
+      (finally (delete-tree! directory)))))
+
+(deftest omp-style-skill-resources-filters-and-precedence
+  (let [directory (.toFile (java.nio.file.Files/createTempDirectory
+                            "bb-agent-skills-"
+                            (make-array java.nio.file.attribute.FileAttribute 0)))
+        user-dir (io/file directory "user")
+        project-skills (io/file directory ".bb-agent" "skills")
+        user-demo (io/file user-dir "skills" "demo")
+        project-demo (io/file project-skills "nested" "demo")
+        hidden-dir (io/file project-skills "hidden")
+        ignored-dir (io/file project-skills "ignored-one")]
+    (doseq [path [user-demo project-demo hidden-dir ignored-dir]]
+      (.mkdirs path))
+    (spit (io/file user-demo "SKILL.md")
+          "---\nname: demo\ndescription: User demo\n---\nUser body")
+    (spit (io/file project-demo "SKILL.md")
+          (str "---\nname: demo\ndescription: Project demo\n"
+               "globs:\n  - '*.clj'\nalwaysApply: true\n"
+               "extra-field: preserved\n---\nProject body"))
+    (spit (io/file project-demo "reference.md") "Reference body")
+    (spit (io/file hidden-dir "SKILL.md")
+          "---\nname: hidden\ndescription: Hidden demo\nhide: true\n---\nHidden body")
+    (spit (io/file ignored-dir "SKILL.md")
+          "---\nname: ignored-one\ndescription: Ignore me\n---\nIgnored")
+    (try
+      (let [ctx (plugin/boot!
+                 {:plugins
+                  [{:ns 'agent.plugins.execution-world
+                    :config {:root (str directory) :sandbox :none}}
+                   {:ns 'agent.plugins.tools}
+                   {:ns 'agent.plugins.trust
+                    :config {:root (str directory) :trusted true}}
+                   {:ns 'agent.plugins.resources
+                    :config {:root (str directory)
+                             :user-dir (str user-dir)
+                             :skills {:include ["demo" "hidden" "ignored*"]
+                                      :ignore ["ignored*"]}}}]})]
+        (try
+          (let [catalog (kernel/require-service ctx :resources/catalog)
+                snapshot ((:snapshot catalog))
+                demo (first (:skills snapshot))
+                read-tool (kernel/tool ctx "read")
+                skill-result ((:execute read-tool)
+                              {:path "skill://demo" :offset 1 :limit 50} {})
+                asset-result ((:execute read-tool)
+                              {:path "skill://demo/reference.md"} {})]
+            (is (= ["demo" "hidden"] (mapv :name (:skills snapshot))))
+            (is (= ["demo"] (mapv :name (:model-skills snapshot))))
+            (is (= :project (:scope demo)))
+            (is (= ["*.clj"] (:globs demo)))
+            (is (:always-apply demo))
+            (is (= "preserved" (get-in demo [:metadata :extra-field])))
+            (is (= :skill/name-collision
+                   (get-in snapshot [:skill-warnings 0 :type])))
+            (is (str/includes? (:content skill-result) "Project body"))
+            (is (= "skill://demo" (:path skill-result)))
+            (is (= "Reference body" (:content asset-result)))
+            (is (thrown-with-msg?
+                 clojure.lang.ExceptionInfo #"escapes"
+                 ((:read-skill-resource catalog)
+                  {:path "skill://demo/../outside.md"})))
+            (is (some #(= "skill:hidden" (:name %))
+                      (command/commands ctx))))
+          (finally (kernel/dispose-all! ctx))))
+      (finally (delete-tree! directory)))))
+
+(deftest agents-user-skills-load-without-project-trust
+  (let [directory (.toFile (java.nio.file.Files/createTempDirectory
+                            "bb-agent-agents-user-"
+                            (make-array java.nio.file.attribute.FileAttribute 0)))
+        agents-root (io/file directory ".agents" "skills")
+        skill-dir (io/file agents-root "shared")]
+    (.mkdirs skill-dir)
+    (spit (io/file skill-dir "SKILL.md")
+          "---\nname: shared\ndescription: Shared user skill\n---\nShared body")
+    (try
+      (let [ctx (plugin/boot!
+                 {:plugins
+                  [{:ns 'agent.plugins.trust
+                    :config {:root (str directory) :trusted false}}
+                   {:ns 'agent.plugins.resources
+                    :config
+                    {:root (str directory)
+                     :user-dir (str (io/file directory "isolated-user"))
+                     :skills
+                     {:agents-user-directories [(str agents-root)]}}}]})]
+        (try
+          (let [snapshot ((:snapshot (kernel/require-service
+                                      ctx :resources/catalog)))]
+            (is (= ["shared"] (mapv :name (:skills snapshot))))
+            (is (= :agents-user (get-in snapshot [:skills 0 :scope])))
+            (is (false? (:project-trusted snapshot))))
+          (finally (kernel/dispose-all! ctx))))
+      (finally (delete-tree! directory)))))
+
+(deftest skill-command-injects-body-and-arguments
+  (let [directory (.toFile (java.nio.file.Files/createTempDirectory
+                            "bb-agent-skill-command-"
+                            (make-array java.nio.file.attribute.FileAttribute 0)))
+        skill-dir (io/file directory ".bb-agent" "skills" "review")
+        request-seen (promise)]
+    (.mkdirs skill-dir)
+    (spit (io/file skill-dir "SKILL.md")
+          "---\nname: review\ndescription: Review code\n---\nInspect the diff carefully.")
+    (try
+      (let [ctx (plugin/boot!
+                 {:plugins
+                  [{:ns 'agent.plugins.session}
+                   {:ns 'agent.plugins.mock
+                    :config {:generate
+                             (fn [request]
+                               (deliver request-seen request)
+                               {:message {:role "assistant" :content "done"}
+                                :finish-reason "stop"})}}
+                   {:ns 'agent.plugins.trust
+                    :config {:root (str directory) :trusted true}}
+                   {:ns 'agent.plugins.resources
+                    :config {:root (str directory)
+                             :user-dir (str (io/file directory "user"))}}
+                   {:ns 'agent.plugins.runtime
+                    :config {:system-prompt "test"}}]})]
+        (try
+          (let [result (command/dispatch! ctx "/skill:review src/core.clj")
+                request (deref request-seen 1000 :timeout)
+                prompt (get-in request [:messages 0 :content])]
+            (is (= :submitted (get-in result [:output :status])))
+            (is (str/includes? prompt "Inspect the diff carefully."))
+            (is (str/includes? prompt "src/core.clj"))
+            (is (not (str/includes? prompt "description: Review code")))
+            (is (= "Skill was not found"
+                   (:error (command/dispatch! ctx "/skill:missing")))))
+          (finally (kernel/dispose-all! ctx))))
+      (finally (delete-tree! directory)))))
+
+(deftest subagent-inherits-parent-skill-catalog
+  (let [directory (.toFile (java.nio.file.Files/createTempDirectory
+                            "bb-agent-child-skill-"
+                            (make-array java.nio.file.attribute.FileAttribute 0)))
+        skill-dir (io/file directory ".bb-agent" "skills" "research")
+        request-seen (promise)]
+    (.mkdirs skill-dir)
+    (spit (io/file skill-dir "SKILL.md")
+          "---\nname: research\ndescription: Research evidence\n---\nFind evidence.")
+    (try
+      (let [ctx
+            (plugin/boot!
+             {:plugins
+              [{:ns 'agent.plugins.trust
+                :config {:root (str directory) :trusted true}}
+               {:ns 'agent.plugins.resources
+                :config {:root (str directory)
+                         :user-dir (str (io/file directory "user"))}}
+               {:ns 'agent.plugins.subagent}
+               {:ns 'agent.plugins.subagent-in-process
+                :config
+                {:allowed-tools ["load_skill"]
+                 :child-profile
+                 {:plugins
+                  [{:ns 'agent.plugins.session}
+                   {:ns 'agent.plugins.mock
+                    :config {:generate
+                             (fn [request]
+                               (deliver request-seen request)
+                               {:message {:role "assistant" :content "done"}
+                                :finish-reason "stop"})}}
+                   {:ns 'agent.plugins.runtime
+                    :config {:system-prompt "child"}}]}}}
+               {:ns 'agent.plugins.subagent-tools}]})]
+        (try
+          (let [delegate (kernel/tool ctx "delegate_task")
+                result ((:execute delegate)
+                        {:prompt "research"
+                         :tool_filter ["load_skill"]}
+                        {:cancel-token (cancellation/create-token)})
+                request (deref request-seen 1000 :timeout)]
+            (is (= :completed (:stop-reason result)))
+            (is (str/includes? (:system-prompt request) "Research evidence"))
+            (is (= ["load_skill"]
+                   (mapv #(get-in % [:function :name]) (:tools request)))))
+          (finally (kernel/dispose-all! ctx))))
+      (finally (delete-tree! directory)))))
+
+(deftest omp-system-prompt-composition-order
+  (let [stable-template @system-prompt/omp-template
+        shared {:contexts [{:name "AGENTS.md" :scope :project
+                            :content "Project rules"}]
+                :skills [{:name "demo" :description "Demo skill"
+                          :scope :project}]
+                :tool-names ["read" "load_skill"]
+                :workspace "/workspace/demo"
+                :local-date "2026-08-19"
+                :project-trusted true}
+        normal (system-prompt/assemble
+                (merge shared {:base-prompt "Stable base"
+                               :append-prompt "Final addendum"}))
+        custom (system-prompt/assemble
+                (merge shared {:base-prompt "Stable base"
+                               :custom-prompt "Custom system"
+                               :append-prompt "Custom addendum"}))
+        always (system-prompt/assemble
+                (assoc shared
+                       :base-prompt "Stable base"
+                       :skills [{:name "policy" :description "Policy"
+                                 :scope :project :always-apply true
+                                 :body "Always follow this policy."}]))]
+    (testing "the stable template prefers the persistent REPL without bypassing purpose-built tools"
+      (is (str/includes? stable-template
+                         "prefer it over `bash` for exact calculations"))
+      (is (str/includes? stable-template
+                         "Continue to use `read`, `grep`, `find`, and `ls`"))
+      (is (str/includes? stable-template
+                         "Never use `bb_repl` to bypass trust")))
+    (testing "normal append content follows generated context"
+      (is (< (str/index-of normal "Stable base")
+             (str/index-of normal "Project rules")
+             (str/index-of normal "Final addendum")))
+      (is (str/includes? normal "load_skill, read")))
+    (testing "SYSTEM replaces only the stable base and keeps generated blocks"
+      (is (not (str/includes? custom "Stable base")))
+      (is (< (str/index-of custom "Custom system")
+             (str/index-of custom "Custom addendum")
+             (str/index-of custom "Project rules")))
+      (is (str/includes? custom "Demo skill"))
+      (is (str/includes? custom "/workspace/demo")))
+    (testing "alwaysApply skill bodies are injected without an extra read"
+      (is (str/includes? always "Always-Applied Skill Instructions"))
+      (is (str/includes? always "Always follow this policy.")))))
+
+(deftest runtime-assembles-trusted-omp-prompt-resources
+  (let [directory (.toFile (java.nio.file.Files/createTempDirectory
+                            "bb-agent-system-prompt-"
+                            (make-array java.nio.file.attribute.FileAttribute 0)))
+        project-dir (io/file directory ".bb-agent")
+        user-dir (io/file directory "user")
+        request-seen (promise)]
+    (.mkdirs project-dir)
+    (.mkdirs user-dir)
+    (spit (io/file directory "AGENTS.md") "Repository instructions")
+    (spit (io/file directory "SYSTEM.md") "Repository system")
+    (spit (io/file project-dir "SYSTEM.md") "Project custom system")
+    (spit (io/file user-dir "SYSTEM.md") "User system")
+    (spit (io/file user-dir "APPEND_SYSTEM.md") "User append")
+    (spit (io/file project-dir "APPEND_SYSTEM.md") "Project append")
+    (try
+      (let [ctx (plugin/boot!
+                 {:plugins
+                  [{:ns 'agent.plugins.session}
+                   {:ns 'agent.plugins.mock
+                    :config
+                    {:generate
+                     (fn [request]
+                       (deliver request-seen request)
+                       {:message {:role "assistant" :content "done"}
+                        :finish-reason "stop"})}}
+                   {:ns 'agent.plugins.trust
+                    :config {:root (str directory) :trusted true}}
+                   {:ns 'agent.plugins.resources
+                    :config {:root (str directory)
+                             :user-dir (str user-dir)}}
+                   {:ns 'agent.plugins.runtime
+                    :config {:system-prompt "Configured base"}}]})]
+        (try
+          ((kernel/require-service ctx :agent/run) "work")
+          (let [catalog (kernel/require-service ctx :resources/catalog)
+                snapshot ((:snapshot catalog))
+                request (deref request-seen 1000 :timeout)
+                prompt (:system-prompt request)]
+            (is (= ["AGENTS.md"] (mapv :name (:contexts snapshot))))
+            (is (= 3 (count (:system-prompts snapshot))))
+            (is (= "Project custom system"
+                   (get-in snapshot [:system-prompt :content])))
+            (is (= "Project append"
+                   (get-in snapshot [:append-system-prompt :content])))
+            (is (not (str/includes? prompt "Configured base")))
+            (is (not (str/includes? prompt "User system")))
+            (is (not (str/includes? prompt "User append")))
+            (is (< (str/index-of prompt "Project custom system")
+                   (str/index-of prompt "Project append")
+                   (str/index-of prompt "Repository instructions")))
+            (is (str/includes? prompt "load_skill"))
+            (is (str/includes? prompt (str (fs/real-path directory)))))
           (finally (kernel/dispose-all! ctx))))
       (finally (delete-tree! directory)))))
 
@@ -2153,6 +2445,6 @@
 
 (defn -main []
   (let [{:keys [fail error]}
-        (run-tests 'agent.test-runner)]
+        (run-tests 'agent.test-runner 'agent.web-test)]
     (when (pos? (+ fail error))
       (throw (ex-info "Tests failed" {:fail fail :error error})))))

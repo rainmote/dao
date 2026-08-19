@@ -44,12 +44,18 @@
       (throw (ex-info "Could not create session directory"
                       {:path (str parent)})))))
 
-(defn- event [type data parent-id]
+(defn- event [type data parent-id sequence]
   (cond-> {:id (str (random-uuid))
+           :seq sequence
            :at (str (Instant/now))
            :type type
            :data data}
     parent-id (assoc :parent_id parent-id)))
+
+(defn- normalize-sequences [events]
+  (mapv (fn [index item] (assoc item :seq (inc index)))
+        (range)
+        events))
 
 (defn- message-event? [item]
   (contains? #{"message" :message} (:type item)))
@@ -125,8 +131,10 @@
      (when path (ensure-parent! path))
      (let [{loaded-events :events loaded-diagnostics :diagnostics}
            (load-events path)
+           loaded-events (normalize-sequences loaded-events)
            events (atom loaded-events)
            diagnostics (atom loaded-diagnostics)
+           listeners (atom {})
            lock (Object.)
            session-id (or (some #(when (= "session/fork" (:type %))
                                    (get-in % [:data :session_id]))
@@ -135,26 +143,32 @@
                                    (get-in % [:data :session_id]))
                                 loaded-events)
                           (str (random-uuid)))
+           notify! (fn [item]
+                     (doseq [listener (vals @listeners)]
+                       (try (listener item) (catch Throwable _)))
+                     item)
            append! (fn
                      ([type data]
                       (locking lock
                         (let [parent-id (:id (last @events))
-                              item (event type data parent-id)]
+                              item (event type data parent-id
+                                          (inc (count @events)))]
                           (when path
                             (spit path
                                   (str (json/generate-string item) "\n")
                                   :append true))
                           (swap! events conj item)
-                          item)))
+                          (notify! item))))
                      ([type data parent-id]
-                      (let [item (event type data parent-id)]
-                        (locking lock
+                      (locking lock
+                        (let [item (event type data parent-id
+                                          (inc (count @events)))]
                           (when path
                             (spit path
                                   (str (json/generate-string item) "\n")
                                   :append true))
-                          (swap! events conj item))
-                        item)))
+                          (swap! events conj item)
+                          (notify! item)))))
            messages #(effective-messages @events)
            compact-body!
            (fn [{:keys [summary retain]
@@ -222,7 +236,8 @@
                             {:session_id fork-session-id
                              :parent_session_id session-id
                              :parent_path (some-> source str)}
-                            (:id (last @events)))]
+                            (:id (last @events))
+                            (inc (count @events)))]
                  {:path (write-events-atomically!
                          target (conj (vec @events) fork-event))
                   :session-id fork-session-id
@@ -276,6 +291,18 @@
                         (checkout-body! event-id options)))
            store {:append! append!
                   :events (fn [] (vec @events))
+                  :events-after (fn [cursor]
+                                  (let [cursor (or cursor 0)]
+                                    (->> @events
+                                         (filter #(> (:seq %) cursor))
+                                         vec)))
+                  :subscribe!
+                  (fn [listener]
+                    (when-not (fn? listener)
+                      (throw (ex-info "Session listener must be a function" {})))
+                    (let [id (str (random-uuid))]
+                      (swap! listeners assoc id listener)
+                      (fn [] (swap! listeners dissoc id))))
                   :messages messages
                   :diagnostics (fn [] (vec @diagnostics))
                   :session-id session-id

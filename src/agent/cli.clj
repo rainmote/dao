@@ -20,6 +20,7 @@
        "  bb agent [--config agent.edn] --mode json --once \"prompt\"\n"
        "  bb agent [--config agent.edn] --mode tui\n"
        "  bb agent [--config agent.edn] --mode rpc\n"
+       "  bb agent [--config agent.edn] --mode rpc --approval-mode ask\n"
        "  bb agent [--config agent.edn]\n"
        "  bb agent [--config agent.edn] --list\n"
        "  bb agent --session PATH [--once \"prompt\"]\n"
@@ -52,6 +53,16 @@
                        (recur (nnext remaining)
                               (assoc options :provider (keyword id)))
                        (throw (ex-info "--provider requires an id" {})))
+        "--approval-mode" (if-let [mode (second remaining)]
+                            (let [value (keyword mode)]
+                              (when-not (contains? #{:allow :deny :ask} value)
+                                (throw (ex-info
+                                        "--approval-mode must be allow, deny, or ask"
+                                        {:mode mode})))
+                              (recur (nnext remaining)
+                                     (assoc options :approval-mode value)))
+                            (throw (ex-info
+                                    "--approval-mode requires a value" {})))
         "--mode" (if-let [mode (second remaining)]
                    (let [value (keyword mode)]
                      (when-not (contains? #{:print :json :rpc :tui} value)
@@ -106,6 +117,35 @@
                  (remove #(and (not= :tui mode)
                                (= 'agent.plugins.tui (:ns %))))
                  vec))))
+
+(defn- approval-plugin-index [plugins]
+  (first
+   (keep-indexed
+    (fn [index spec]
+      (when (= 'agent.plugins.approval (:ns spec)) index))
+    plugins)))
+
+(defn- with-approval-mode [config mode]
+  (if-not mode
+    config
+    (let [index (approval-plugin-index (:plugins config))]
+      (when-not index
+        (throw (ex-info "Profile has no approval plugin to configure" {})))
+      (assoc-in config [:plugins index :config :mode] mode))))
+
+(defn- with-remote-interaction [config mode]
+  (if (not= :rpc mode)
+    config
+    (let [plugins (:plugins config)
+          approval-index (approval-plugin-index plugins)]
+      (when-not approval-index
+        (throw (ex-info "RPC profile has no approval plugin" {})))
+      (if (some #(= 'agent.plugins.remote-interaction (:ns %)) plugins)
+        config
+        (assoc config :plugins
+               (vec (concat (subvec plugins 0 approval-index)
+                            [{:ns 'agent.plugins.remote-interaction}]
+                            (subvec plugins approval-index))))))))
 
 (defn- print-inventory [ctx]
   (println "Plugins:")
@@ -210,7 +250,8 @@
 (defn -main [& args]
   (let [{profile-path :config
          session-info? :session-info
-         :keys [prompt list help session fork compact provider mode]}
+         :keys [prompt list help session fork compact provider mode
+                approval-mode]}
         (parse-args args)]
     (if help
       (println usage)
@@ -226,6 +267,8 @@
             config (-> (plugin/read-config profile-path)
                        (with-session-path session)
                        (for-mode mode)
+                       (with-remote-interaction mode)
+                       (with-approval-mode approval-mode)
                        (cond-> interactive-tui? ensure-tui-session-path))
             allow-external-plugins (trust/trusted-root? ".")]
         (if interactive-tui?

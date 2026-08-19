@@ -27,6 +27,8 @@ coverage/
 tmp/
 temp/
 *.log
+node_modules/
+apps/web/dist/
 
 # Editor and operating-system files
 .DS_Store

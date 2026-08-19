@@ -63,11 +63,19 @@
                ".]"))]
     (str content (when-not (str/blank? content) "\n\n") notice)))
 
-(defn- read-tool [world default-lines max-chars]
+(defn- skill-url? [path]
+  (and (string? path) (str/starts-with? path "skill://")))
+
+(defn- skill-resources [ctx]
+  (or (kernel/service ctx :resources/catalog)
+      (throw (ex-info "skill:// requires the resource catalog plugin" {}))))
+
+(defn- read-tool [ctx world default-lines max-chars]
   {:name "read"
    :description (str "Read UTF-8 file lines. offset is a one-based line "
                      "number and limit is the maximum number of lines. "
-                     "Continue with the offset reported by a truncated result.")
+                     "Continue with the offset reported by a truncated result. "
+                     "Discovered skills and their assets use skill:// URLs.")
    :parameters {:type "object"
                 :required ["path"]
                 :properties {"path" {:type "string"}
@@ -76,16 +84,20 @@
                              "limit" {:type "integer" :minimum 1
                                       :description "Maximum lines to return."}}
                 :additionalProperties false}
-   :approval-target #(target-path world (:path %) false)
+   :approval-target #(if (skill-url? (:path %))
+                       {:provider :resources :path (:path %)}
+                       (target-path world (:path %) false))
    :execute
    (fn [{:keys [offset] :as args} _]
      (let [requested-offset (or offset 1)
-           result ((:read! world)
-                   (assoc args
+           request (assoc args
                           :offset (dec requested-offset)
                           :unit :lines
                           :limit (or (:limit args) default-lines)
-                          :max-chars max-chars))]
+                          :max-chars max-chars)
+           result (if (skill-url? (:path args))
+                    ((:read-skill-resource (skill-resources ctx)) request)
+                    ((:read! world) request))]
        (when (and (pos? requested-offset)
                   (or (and (zero? (:total-lines result)) (> requested-offset 1))
                       (and (pos? (:total-lines result))
@@ -99,8 +111,8 @@
    :result-details (fn [_ value] (read-details value))
    :render render-read-result})
 
-(defn- read-file-alias [world default-lines max-chars]
-  (assoc (read-tool world default-lines max-chars)
+(defn- read-file-alias [ctx world default-lines max-chars]
+  (assoc (read-tool ctx world default-lines max-chars)
          :name "read_file"
          :description "Compatibility alias for read."))
 
@@ -242,7 +254,8 @@
      (let [world (kernel/require-service ctx :execution/world)
            process? (contains? (:capabilities world) :process)]
        (doseq [tool (cond-> [(current-time-tool)
-                             (read-tool world default-read-lines max-read-chars)
+                             (read-tool ctx world default-read-lines
+                                        max-read-chars)
                              (write-tool world)
                              (edit-tool world)
                              (list-tool world)
@@ -250,7 +263,7 @@
                              (grep-tool world)]
                       process? (conj (bash-tool world timeout-ms))
                       compatibility-read-file
-                      (conj (read-file-alias world default-read-lines
+                      (conj (read-file-alias ctx world default-read-lines
                                              max-read-chars)))]
          (kernel/register-tool! ctx tool)))
      nil)})

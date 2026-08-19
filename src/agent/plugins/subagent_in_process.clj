@@ -66,6 +66,23 @@
                        :disallowed (set outside)})))
     (or requested base)))
 
+(defn- inherit-parent-resources! [child parent]
+  (when-let [resources (and parent
+                            (kernel/service parent :resources/catalog))]
+    (let [bridge (kernel/plugin-context child :subagent/parent-resources)]
+      (when-not (kernel/service child :resources/catalog)
+        ;; The catalog switches atomically and exposes read-only skill access,
+        ;; so a child can share it without rescanning or bypassing parent trust.
+        (kernel/register-service! bridge :resources/catalog resources))
+      (when (and (kernel/tool parent "load_skill")
+                 (nil? (kernel/tool child "load_skill")))
+        (kernel/register-tool! bridge (kernel/tool parent "load_skill")))
+      (kernel/mark-loaded!
+       child
+       {:id :subagent/parent-resources
+        :namespace 'agent.plugins.subagent-in-process
+        :description "Inherited read-only skill catalog from the parent."}))))
+
 (defn- install-boundary! [child {:keys [tool-filter persona output-schema]}]
   (let [boundary (kernel/plugin-context child :subagent/child-boundary)
         schema-text (when output-schema (json/generate-string output-schema))
@@ -135,6 +152,7 @@
               (when (= :fork mode)
                 (seed! child (completed-parent-messages
                               (:parent-context request))))
+              (inherit-parent-resources! child (:parent-context request))
               (install-boundary! child
                                  {:tool-filter tools
                                   :persona (:persona request)

@@ -1,9 +1,10 @@
 # OMP-inspired coding foundation 插件
 
-`agent.plugins.omp` 把 Oh My Pi 中最适合当前架构的两项能力移植为一个可逆插件：
+当前实现把 Oh My Pi 中最适合现有架构的三项能力移植进来：
 
 1. 内容哈希锚定的完整文件读取与批量编辑；
-2. 角色到 provider 的请求路由。
+2. 角色到 provider 的请求路由；
+3. 稳定模板、项目上下文与覆盖文件分离的 system prompt 装配。
 
 插件不替换默认 agent loop、ExecutionWorld 或现有 `edit` 工具。把它从 profile 的
 `:plugins` 中移除后，工具、命令、service 和 interceptor 会按微内核 effect 机制一并撤销。
@@ -35,6 +36,109 @@
 
 嵌入调用也可以为单次请求传入 `:model-options {:role :plan}`，其优先级高于当前 `/role`
 状态。路由不会改变 model registry 的全局选择，因此一次计划请求不会污染后续普通请求。
+
+## System prompt 装配
+
+默认 profile 通过以下配置启用内置 OMP 风格模板：
+
+```clojure
+{:ns agent.plugins.runtime
+ :config {:max-steps 12
+          :system-prompt-template :omp}}
+```
+
+每次模型请求前，runtime 都会重新组合 provider-facing system prompt：
+
+1. 内置稳定模板，或兼容旧配置的 `:system-prompt` 字符串；
+2. 已信任的 `AGENTS.md` 项目上下文和渐进加载的 skill 摘要；
+3. 当前工具名、工作目录、日期与项目资源信任状态；
+4. 可选的覆盖层。
+
+支持用户目录（默认 `~/.bb-agent`）、项目根目录和项目 `.bb-agent` 目录中的以下文件：
+
+- `SYSTEM.md`：替换稳定基础模板，但保留动态上下文、技能、工具和环境块；
+- `APPEND_SYSTEM.md`：追加额外指令；存在 `SYSTEM.md` 时紧随自定义模板，否则位于完整生成提示词末尾；
+- `AGENTS.md`：作为项目上下文注入，不会被误当成基础模板。
+
+优先级为项目 `.bb-agent`、项目根目录、用户目录。未信任项目的文件全部忽略，用户目录资源仍可使用。
+运行时配置的 `:custom-system-prompt` 和 `:append-system-prompt` 分别高于对应文件，方便嵌入式调用做显式覆盖。
+普通的 `:system-prompt` 仍表示稳定基础模板，因此现有 profile 不需要迁移。
+
+## Skills
+
+Skills 使用 progressive disclosure：system prompt 只列出可由模型调用的名称、描述和 glob，
+模型匹配后通过普通 `read` 工具读取 `skill://<name>`。`load_skill` 仍保留用于兼容旧 prompt。
+
+默认目录：
+
+```text
+~/.bb-agent/skills/<name>/SKILL.md
+~/.agents/skills/<name>/SKILL.md
+<project>/.bb-agent/skills/<name>/SKILL.md
+```
+
+扫描是递归的，因此也允许 `skills/team/domain/<name>/SKILL.md`。与 OMP 的单层扫描相比，
+这是当前实现有意保留的扩展。
+
+完整配置：
+
+```clojure
+{:ns agent.plugins.resources
+ :config
+ {:root "."
+  :skills
+  {:enabled true
+   :enable-user true
+   :enable-project true
+   :enable-agents-user true
+   :enable-commands true
+   :require-description true
+   :agents-user-directories ["/Users/me/.agents/skills"]
+   :custom-directories ["vendor/agent-skills"]
+   :include ["review-*" "docs"]
+   :ignore ["*-experimental"]}}}
+```
+
+正常 profile 默认把 `~/.agents/skills` 放入 `:agents-user-directories`；若调用方显式传入
+`:user-dir`，则视为隔离用户资源环境，不再隐式加入真实 home，此时可以像上例一样显式指定。
+该用户级来源不依赖项目 trust。
+
+相对目录以 workspace 为基准。custom directory 只在项目可信时加载。同名 skill
+按“custom directory、project `.bb-agent`、user `.bb-agent`、agents-user”选择第一个，并在 snapshot 的 `:skill-warnings` 中记录
+被忽略路径；相同 realpath 会直接去重。include/ignore 是对 skill 名称应用的 glob，ignore
+最后生效。
+
+`SKILL.md` 使用 YAML frontmatter：
+
+```markdown
+---
+name: code-review
+description: Review changes for correctness and regressions
+globs:
+  - "*.clj"
+alwaysApply: false
+hide: false
+disable-model-invocation: false
+owner: platform
+---
+
+Review the complete diff before reporting findings.
+```
+
+`name`、`description`、`globs` 和布尔字段会校验类型；未知字段原样保留在 metadata。
+`alwaysApply` 会把正文直接加入 system prompt；`hide` 和 `disable-model-invocation` 会把 skill
+从模型摘要中移除，但不会禁止 `skill://` 或用户显式调用。
+
+`skill://<name>` 指向 `SKILL.md`，`skill://<name>/<relative-path>` 指向 skill 目录内的附属
+文件。解析会拒绝绝对路径、`..` 穿越、逃逸 symlink、目录和不存在的文件。读取仍支持普通
+`read` 的 offset、limit 和字符截断语义。
+
+开启 commands 后，每个 skill 动态显示为 `/skill:<name> [args]`。空闲时它启动一次正常
+turn；agent 正在运行时则作为 steering message 注入。正文会剥离 frontmatter，并附带虚拟
+base directory 和用户参数。`/reload` 后命令列表直接使用新 catalog，无需重启。
+
+in-process spawn/fork 子 Agent 会继承父会话的只读 catalog 和 `load_skill` 工具；其工具
+过滤仍不能扩大父 profile 的权限。
 
 ## 锚定编辑流程
 

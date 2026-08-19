@@ -90,7 +90,8 @@
    {:max-depth 1
     ;; A request may narrow this set but can never expand it. Mutating and
     ;; process tools remain unavailable to unattended child agents.
-    :allowed-tools ["current_time" "read" "read_file" "ls" "find" "grep"]
+    :allowed-tools ["current_time" "read" "read_file" "ls" "find" "grep"
+                    "load_skill"]
     :child-profile
     {:plugins
      [{:ns agent.plugins.session :config {:path nil :ephemeral true}}
@@ -132,6 +133,10 @@
   {:ns agent.plugins.resources
    :config {:root "."}}
 
+  ;; Remote methods are frontend-neutral. RPC mode inserts a remote interaction
+  ;; bridge before approval so the worker never reads prompts from stdin.
+  {:ns agent.plugins.remote-registry}
+
   {:ns agent.plugins.approval
    ;; Change to :ask for a confirmation before each bb_repl call.
    :config {:mode :allow}}
@@ -155,8 +160,9 @@
 
   {:ns agent.plugins.runtime
    :config {:max-steps 12
-            :system-prompt
-            "You are a concise coding assistant. Use read, write, edit, bash, grep, find, and ls to work accurately in the project. Use lsp_query for semantic diagnostics, definitions, references, hover, and symbols when a matching language server is available. For non-trivial or concurrently changing files, prefer hash_read followed by one hash_edit batch; always run hash_read again before a later hash_edit on the same file. Use bb_repl for exact calculations and Clojure data transformations. Never invent tool results."}}
+            :system-prompt-template :omp}}
+
+  {:ns agent.plugins.remote-api}
 
   {:ns agent.plugins.tui
    :config {:root "."

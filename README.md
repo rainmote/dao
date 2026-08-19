@@ -34,6 +34,18 @@ bb agent --config examples/mock.edn --once "六乘七是多少？"
 bb test
 ```
 
+启动 DeepSeek Harness 风格的本地 WebUI（首次先安装 Node 依赖）：
+
+```bash
+npm install
+bb web
+```
+
+WebUI 默认只监听 `127.0.0.1:3080`，启动后打开终端打印的鉴权 URL。它提供工作区白名单、
+会话恢复、流式时间线、通用工具卡、远程审批、模型选择、subagent 状态和插件清单；每个打开
+的会话由独立 Babashka Worker 执行，TUI 与 WebUI 共享同一份插件和 append-only session。
+架构、协议、安全边界与开发命令见 [WebUI 文档](docs/webui.md)。
+
 默认使用 Codex/ChatGPT 订阅登录：
 
 ```bash
@@ -206,9 +218,12 @@ trust store 示例（路径应使用 canonical absolute path）：
 
 ## 资源、模型与外部协议
 
-trust 之后，resource catalog 会发现用户级 `~/.bb-agent/` 与项目级 `.bb-agent/` 的
+resource catalog 会发现用户级 `~/.bb-agent/`、跨 agent 的 `~/.agents/skills/`，以及项目级 `.bb-agent/` 的
 `AGENTS.md`、`SYSTEM.md`、prompt 和 skill。skill 启动时只注入 name/description；模型用
-`load_skill` 读取完整 `SKILL.md`。`/reload` 先完整验证新目录再原子切换。
+`read skill://<name>` 读取完整 `SKILL.md`，并可继续读取
+`skill://<name>/references/...` 等同目录资源。`load_skill` 保留为兼容入口，用户也可通过
+`/skill:<name> [args]` 显式调用。YAML frontmatter、同名优先级、include/ignore、隐藏 skill
+及子 Agent 继承均由 catalog 统一处理；`/reload` 先完整验证新目录再原子切换。
 
 model registry 允许多个 adapter 同时注册 metadata，并用 `/model`、`/model PROVIDER` 或
 `--provider PROVIDER` 查看和切换。auth store 每次请求动态解析 Codex cache 或环境 key，
@@ -221,10 +236,11 @@ bb agent --config examples/mock.edn --mode json --once "六乘七是多少？"
 bb agent --config examples/mock.edn --mode rpc
 ```
 
-RPC 支持 prompt、steer、follow-up、abort、state、clear、compact、sessions、providers、
-select-provider、reload 与 shutdown；
-stdout 只输出 version 1 JSON，诊断仍走 stderr。用户消息也支持 typed text/image content
-blocks，ChatGPT Responses 与 OpenAI-compatible adapter 会转换成各自的多模态格式。
+RPC 保留 prompt、steer、follow-up、abort、state、clear、compact、sessions、providers、
+select-provider、reload 与 shutdown，并新增声明式、JSON Schema 校验的 Remote API，覆盖
+session snapshot/cursor、turn、interaction、model、command、runtime 与 subagent。stdout 只
+输出 version 1 JSON，诊断仍走 stderr。用户消息也支持 typed text/image content blocks，
+ChatGPT Responses 与 OpenAI-compatible adapter 会转换成各自的多模态格式。
 
 ## 插件写法
 
