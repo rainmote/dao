@@ -156,8 +156,13 @@
         "compact" (output ((:compact! store)))
         "fork" (output ((:fork! store) argument))
         "clear" (do ((:clear! store)) (output {:cleared true}))
-        "theme" {:handled true :ui :theme-selector
-                   :theme (when-not (str/blank? argument) (keyword argument))}
+        "theme"
+        (let [requested (when-not (str/blank? argument) (keyword argument))]
+          (when-let [set-theme! (and requested
+                                     (:set-theme!
+                                      (kernel/service ctx :ui/extensions)))]
+            (set-theme! requested))
+          {:handled true :ui :theme-selector :theme requested})
         (cond
           (str/starts-with? name "skill:")
           (invoke-skill! ctx session name argument)

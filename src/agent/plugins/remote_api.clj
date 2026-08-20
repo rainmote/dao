@@ -15,6 +15,17 @@
 (defn- public-provider [entry]
   (some-> entry (dissoc :generate)))
 
+(defn- public-command-result [command-name result]
+  (if-not (= "model" command-name)
+    result
+    (update result :output
+            (fn [output]
+              (if (and (map? output) (contains? output :providers))
+                (-> output
+                    (update :current public-provider)
+                    (update :providers #(mapv public-provider %)))
+                (public-provider output))))))
+
 (defn- session-snapshot [ctx]
   (let [store (kernel/require-service ctx :session/store)
         session (kernel/require-service ctx :agent/session)
@@ -166,7 +177,8 @@
                       (throw (ex-info
                               "This command is unavailable over the remote boundary"
                               {:command name})))
-                    (command/dispatch! ctx command-text))))
+                    (public-command-result
+                     name (command/dispatch! ctx command-text)))))
        (method! "runtime.status" "Describe loaded plugins, tools, and resources."
                 empty-params {:type "object"}
                 (fn [_]

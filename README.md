@@ -20,7 +20,13 @@ flowchart LR
 
 ## 快速运行
 
-要求 Babashka 1.13 或更新版本。
+要求 Babashka 1.13 或更新版本。默认交互界面使用 React/Ink，还需要 Node.js 22.12 或
+更新版本。首次运行先安装并构建 TUI：
+
+```bash
+npm install
+bb tui-build
+```
 
 先运行完全离线的两轮工具调用示例：
 
@@ -34,7 +40,7 @@ bb agent --config examples/mock.edn --once "六乘七是多少？"
 bb test
 ```
 
-启动 DeepSeek Harness 风格的本地 WebUI（首次先安装 Node 依赖）：
+启动 DeepSeek Harness 风格的本地 WebUI（尚未安装 Node 依赖时先运行 `npm install`）：
 
 ```bash
 npm install
@@ -104,20 +110,27 @@ API key。认证缓存位置是官方文档支持的，但订阅后端协议并�
 插件也可以连接其他兼容 `/chat/completions` 的服务。Codex Responses 和 DeepSeek Chat
 Completions 都会把文本 delta 立即写到终端，不再等待完整响应下载结束。
 
-交互模式默认是全屏 TUI，包含流式 Markdown、工具实时输出与折叠、多行编辑、历史和
-命令/路径补全，以及 model、session tree、session catalog、theme selector。离线体验：
+交互模式默认加载 `agent.plugins.tui-ink`：Babashka 继续持有 session、agent loop、工具与
+审批，Node/React/Ink 子进程只负责全屏终端界面。当前界面按 Qwen Code 的默认暗色、
+欢迎 banner、消息符号、双横线输入区与弹窗布局呈现，并包含带代码/diff 分栏预览、可即时切换的 Qwen
+内置主题、session 恢复、流式
+Markdown/reasoning、紧凑工具状态、多行 Unicode 输入、命令补全、输入历史、长会话虚拟滚动，
+以及 model、session、theme 和审批选择器。离线体验：
 
 ```bash
+bb tui-build
 bb agent --config examples/tui-mock.edn --mode tui
 ```
 
-同一次工具执行只显示一张状态卡：运行中展示参数和最新输出，完成后原地更新状态、耗时与
-结果摘要；`Ctrl+O` 可展开完整细节。
+同一次工具执行只显示一组紧凑状态行：运行中展示参数和最新输出，完成后原地更新状态、
+耗时与结果摘要；`Ctrl+O` 可展开完整细节。
 
-`Enter` 提交（运行中为 steer），`Alt+Enter` 把消息排到本轮完成后，`Ctrl+N` 换行，
-`Ctrl+S` 也可 steer，`Esc` 中止，`Ctrl+O` 折叠工具，`Ctrl+T` 切换主题，`Tab`
-补全，`PageUp/PageDown` 或鼠标滚轮查看历史。向上滚动后，新消息不会强制把视口拉回
-底部。完整按键、主/备用屏配置及插件 UI 接口见 [TUI 文档](docs/tui.md)。
+`Enter` 在空闲时提交、运行中 steer；`Alt+Enter` 在运行中排入 follow-up，空闲时插入
+换行；`Ctrl+N`、`Ctrl+Enter` 或 `Shift+Enter` 也可换行；`Esc`/`Ctrl+C` 中止当前运行，
+`Ctrl+O` 展开或折叠 reasoning 与工具详情，`Tab` 补全 slash command，
+`PageUp/PageDown` 查看历史。向上滚动后，新消息不会强制把视口拉回底部。`/model`、
+`/sessions` 和 `/theme` 打开对应选择器。完整安装、按键、命令、TTY/JSONL 架构与旧版
+Clojure TUI 兼容方式见 [TUI 文档](docs/tui.md)。
 
 默认 profile 会显示实际发生的工具调用：
 
@@ -210,11 +223,11 @@ trust store 示例（路径应使用 canonical absolute path）：
          "/absolute/path/to/projects/untrusted" :deny}}
 ```
 
-新项目默认不可信。首次进入 TUI 时会在接受输入前显示信任选择：可以信任项目、以受限
-模式打开或直接退出。决定会原子写入上述用户 trust store，并立即刷新项目资源；受限模式
-下 Bash、写入和 `bb_repl` 会保持禁用。之后可用 `/trust` 查看状态，或用 `/trust allow`、
-`/trust deny` 修改。非交互的 `--once`、JSON/RPC 模式不会自行弹出确认。需要逐次确认工具
-时，把 `agent.edn` 中 approval `:mode` 改成 `:ask`。
+新项目默认不可信，Bash、写入和 `bb_repl` 会保持禁用。当前 Ink TUI 不会在启动时自动
+弹出项目信任向导；用 `/trust` 查看状态，确认路径无误后用 `/trust allow` 信任，或用
+`/trust deny` 明确保持受限。决定会原子写入上述用户 trust store，并立即刷新项目资源。
+非交互的 `--once`、JSON/RPC 模式同样不会自行弹出确认。需要逐次确认工具时，把
+`agent.edn` 中 approval `:mode` 改成 `:ask`。
 
 ## 资源、模型与外部协议
 
@@ -276,10 +289,14 @@ ChatGPT Responses 与 OpenAI-compatible adapter 会转换成各自的多模态�
 
 注册 service、tool、observer、interceptor 和自定义 disposer 都会形成 effect。插件卸载时，effect 按注册的逆序撤销，不会留下旧工具或事件监听器。
 
-TUI 也是普通插件。第三方插件可通过 `agent.ui` 可逆注册 message/entry/tool renderer、
-shortcut、status、widget，并调用 select/confirm/input/custom overlay。工具可以分别声明
-`:render-model` 和 `:render-tui`，避免模型上下文文本与终端表现互相绑死；示例见
-`plugins/example/ui_demo.clj`。
+TUI 也是普通插件。默认 `agent.plugins.tui-ink` 通过 frontend-neutral Remote API 和
+`agent.ui` prompt 边界接入，不把 React 状态塞进 agent loop。当前 Ink 界面已经处理
+approval、select、confirm、input 和 custom prompt，也会投影 JSON-safe status、widget 和
+notification，并通过 Remote API 调用注册在 host 的 shortcut handler。Clojure
+message/entry/tool renderer 函数不能跨进程变成 React 组件，函数值字段只显示不可用占位符；
+需要原生 renderer 时仍可使用兼容的 `agent.plugins.tui`。
+工具仍可分别声明 `:render-model` 和 `:render-tui`，避免模型上下文文本与终端表现互相绑死；
+旧 TUI 扩展示例见 `plugins/example/ui_demo.clj`。
 
 ## 设计要点
 
@@ -330,7 +347,9 @@ src/agent/protocol.clj          version 1 JSON event 与 stdin/stdout RPC
 src/agent/api.clj               稳定的公开 Clojure embedding API
 src/agent/command.clj           line/TUI 共用的 slash command dispatcher
 src/agent/ui.clj                可逆 UI extension 与 prompt API
-src/agent/plugins/tui.clj       JLine 全屏 TUI、Model/Update/View 与 overlay
+src/agent/plugins/tui_ink.clj   默认 Ink 子进程、TTY/JSONL bridge 与 prompt adapter
+apps/tui/                       React/Ink UI、projection、transport 与组件测试
+src/agent/plugins/tui.clj       兼容的 JLine/Clojure 全屏 TUI
 src/agent/plugins/*.clj         tools、trust、approval、policy、stream、trace、mock
 plugins/example/math.clj        仓库外置插件示例
 examples/mock.edn               无 API key 的确定性演示

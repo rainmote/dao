@@ -7,16 +7,21 @@
     "node": ">=22.12.0"
   },
   "scripts": {
-    "test": "npm run typecheck && npm run test:web && npm run test:web-ui && bb test",
+    "test": "npm run typecheck && npm run test:web && npm run test:web-ui && npm run test:tui && bb test",
+    "tui:build": "esbuild apps/tui/main.tsx --bundle --platform=node --format=esm --packages=external --outfile=apps/tui/dist/main.js",
+    "tui:dev": "tsx apps/tui/main.tsx",
     "web": "npm run web:build && npm run web:start",
     "web:build": "vite build",
     "web:start": "tsx apps/web-host/server.ts",
     "typecheck": "tsc --noEmit",
     "test:web": "tsx --test apps/web-host/*.test.ts",
-    "test:web-ui": "tsx --test apps/web/src/*.test.tsx"
+    "test:web-ui": "tsx --test apps/web/src/*.test.tsx",
+    "test:tui": "tsx --test apps/tui/*.test.ts apps/tui/*.test.tsx apps/tui/components/*.test.tsx"
   },
   "dependencies": {
     "@vitejs/plugin-react": "6.0.5",
+    "ink": "^7.0.3",
+    "ink-gradient": "^3.0.0",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "react-markdown": "10.1.0",
@@ -27,6 +32,8 @@
     "@types/node": "26.2.0",
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.4",
+    "esbuild": "^0.28.0",
+    "ink-testing-library": "^4.0.0",
     "tsx": "4.23.12",
     "typescript": "7.0.2"
   }

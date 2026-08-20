@@ -115,7 +115,9 @@
                  (remove #(and (= :tui mode)
                                (= 'agent.plugins.trace (:ns %))))
                  (remove #(and (not= :tui mode)
-                               (= 'agent.plugins.tui (:ns %))))
+                               (contains? #{'agent.plugins.tui
+                                            'agent.plugins.tui-ink}
+                                          (:ns %))))
                  vec))))
 
 (defn- approval-plugin-index [plugins]

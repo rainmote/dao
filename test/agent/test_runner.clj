@@ -12,11 +12,13 @@
             [agent.plugins.chatgpt]
             [agent.plugins.omp]
             [agent.plugins.openai]
+            [agent.plugins.remote-api :as remote-api]
             [agent.plugins.subagent]
             [agent.plugins.subagent-in-process]
             [agent.plugins.subagent-tools]
             [agent.plugins.trust :as trust]
             [agent.plugins.tui :as tui]
+            [agent.plugins.tui-ink :as tui-ink]
             [agent.schema :as schema]
             [agent.streaming :as streaming]
             [agent.system-prompt :as system-prompt]
@@ -74,6 +76,164 @@
     (is (nil? (get-in (cli/ensure-tui-session-path
                        (assoc-in base [:plugins 0 :config :ephemeral] true))
                       [:plugins 0 :config :path])))))
+
+(deftest ink-tui-is-profile-selected-and-excluded-from-rpc-workers
+  (let [profile {:plugins [{:ns 'agent.plugins.session}
+                           {:ns 'agent.plugins.tui-ink}]}
+        for-mode (var-get #'cli/for-mode)]
+    (is (= ['agent.plugins.session 'agent.plugins.tui-ink]
+           (mapv :ns (:plugins (for-mode profile :tui)))))
+    (is (= ['agent.plugins.session]
+           (mapv :ns (:plugins (for-mode profile :rpc))))))
+  (let [ctx (plugin/boot!
+             {:plugins
+              [{:ns 'agent.plugins.session}
+               {:ns 'agent.plugins.mock :config {:responses []}}
+               {:ns 'agent.plugins.remote-registry}
+               {:ns 'agent.plugins.runtime}
+               {:ns 'agent.plugins.remote-api}
+               ;; The command must not be launched until :run! is invoked.
+               {:ns 'agent.plugins.tui-ink
+                :config {:command ["missing-ink-tui-test-command"]}}]})]
+    (try
+      (is (some? (kernel/service ctx :frontend/interactive)))
+      (is (some? (kernel/service ctx :ui/prompt)))
+      (is (some? (kernel/service ctx :ui/extensions)))
+      (is (contains?
+           (set (map :method
+                     ((:methods (kernel/require-service
+                                 ctx :remote/registry)))))
+           "frontend.exit"))
+      (finally
+        (kernel/dispose-all! ctx)))))
+
+(deftest ink-tui-projects-extensions-safely-and-invokes-only-shortcuts
+  (let [ctx (plugin/boot!
+             {:plugins
+              [{:ns 'agent.plugins.session}
+               {:ns 'agent.plugins.mock :config {:responses []}}
+               {:ns 'agent.plugins.remote-registry}
+               {:ns 'agent.plugins.runtime}
+               {:ns 'agent.plugins.tui-ink
+                :config {:command ["missing-ink-tui-test-command"]}}]})
+        extension-ctx (kernel/plugin-context ctx :test/ink-extension)
+        observer-ctx (kernel/plugin-context ctx :test/ink-error-observer)
+        invocations (atom [])
+        errors (atom [])]
+    (try
+      (kernel/on! observer-ctx :ui/run-error
+                  (fn [_ event] (swap! errors conj event)))
+      (ui/set-status! extension-ctx :static "ready")
+      (ui/set-status! extension-ctx :dynamic (fn [] "not portable"))
+      (ui/set-widget! extension-ctx :dynamic-widget
+                      (fn [_] ["not portable"]))
+      (ui/register-shortcut!
+       extension-ctx "ctrl+g"
+       {:description "Run registered action"
+        :handler #(swap! invocations conj
+                         (select-keys % [:frontend :shortcut]))})
+      (ui/register-shortcut!
+       extension-ctx "ctrl+e"
+       {:description "Fail safely"
+        :handler (fn [_] (throw (ex-info "shortcut failed" {})))})
+      (let [extensions (kernel/require-service ctx :ui/extensions)
+            registry (kernel/require-service ctx :remote/registry)
+            snapshot ((:snapshot extensions))]
+        (is (string? (json/generate-string snapshot)))
+        (is (= "ready"
+               (get-in snapshot [:registries :statuses "static" "value"])))
+        (is (= "[host function unavailable]"
+               (get-in snapshot
+                       [:registries :statuses "dynamic" "value"])))
+        (is (= "[host function unavailable]"
+               (get-in snapshot
+                       [:registries :widgets "dynamic-widget" "value"])))
+        (is (= true
+               (get-in snapshot
+                       [:registries :shortcuts "ctrl+g" :host-invokable])))
+        (is (= {:shortcut "ctrl+g" :invoked true}
+               ((:invoke! registry) "ui.shortcut.invoke"
+                {:shortcut "ctrl+g"})))
+        (is (= [{:frontend :tui-ink :shortcut "ctrl+g"}] @invocations))
+        (is (= false
+               (:invoked ((:invoke! registry) "ui.shortcut.invoke"
+                          {:shortcut "ctrl+e"}))))
+        (is (= [{:shortcut "ctrl+e" :message "shortcut failed"}] @errors))
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"not registered"
+             ((:invoke! registry) "ui.shortcut.invoke"
+              {:shortcut "ctrl+unknown"}))))
+      (let [live-events (set (var-get
+                              (ns-resolve 'agent.plugins.tui-ink
+                                          'live-events)))]
+        (is (contains? live-events :ui/run-error))
+        (is (not (contains? live-events :llm/stream))))
+      (finally
+        (kernel/dispose-all! ctx)))))
+
+(deftest ink-tui-rpc-reader-resolves-prompts-opened-by-command-handlers
+  (let [node-script
+        (str
+         "let buffer='';"
+         "const send=value=>console.log(JSON.stringify(value));"
+         "process.stdin.setEncoding('utf8');"
+         "process.stdin.on('data',chunk=>{buffer+=chunk;"
+         "const lines=buffer.split('\\n');buffer=lines.pop();"
+         "for(const line of lines){if(!line)continue;"
+         "const message=JSON.parse(line);"
+         "if(message.type==='ready'){"
+         "send({type:'request',id:'command',method:'command.execute',"
+         "params:{command:'/ask'}});"
+         "}else if(message.type==='event'&&"
+         "message.event==='interaction/request'){"
+         "if(message.data.kind!=='input')process.exit(7);"
+         "send({type:'request',id:'prompt',method:'ui.prompt.resolve',"
+         "params:{id:message.data.id,value:'typed'}});"
+         "}else if(message.type==='response'&&message.id==='command'){"
+         "if(!message.ok||message.result.output!=='typed')process.exit(8);"
+         "send({type:'request',id:'exit',method:'frontend.exit',params:{}});"
+         "}else if(message.type==='response'&&message.id==='exit'){"
+         "process.exit(message.ok?0:9);}}});")
+        ctx (plugin/boot!
+             {:plugins
+              [{:ns 'agent.plugins.session}
+               {:ns 'agent.plugins.mock :config {:responses []}}
+               {:ns 'agent.plugins.remote-registry}
+               {:ns 'agent.plugins.runtime}
+               {:ns 'agent.plugins.remote-api}
+               {:ns 'agent.plugins.tui-ink
+                :config {:command ["node" "-e" node-script]
+                         :interaction-timeout-ms 2000
+                         :shutdown-timeout-ms 1000}}]})
+        command-ctx (kernel/plugin-context ctx :test/async-prompt-command)]
+    (try
+      (kernel/register-command!
+       command-ctx
+       {:name "ask"
+        :description "Open an input prompt from an RPC command."
+        :execute
+        (fn [_ {:keys [context]}]
+          (ui/input! context {:title "Answer" :schema {:type "string"}}))})
+      (is (nil? ((:run! (kernel/require-service
+                          ctx :frontend/interactive)))))
+      (finally
+        (kernel/dispose-plugin! ctx :test/async-prompt-command)
+        (kernel/dispose-all! ctx)))))
+
+(deftest remote-model-command-results-are-json-safe
+  (let [sanitize (var-get #'remote-api/public-command-result)
+        generate (fn [_] {:message {:role "assistant" :content "unused"}})
+        result (sanitize
+                "model"
+                {:handled true
+                 :ui :model-selector
+                 :output {:current {:id :one :model "one" :generate generate}
+                          :providers [{:id :one :model "one"
+                                       :generate generate}]}})
+        encoded (json/generate-string result)]
+    (is (string? encoded))
+    (is (nil? (get-in result [:output :current :generate])))
+    (is (nil? (get-in result [:output :providers 0 :generate])))))
 
 (deftest tui-prompts-for-an-undecided-project-before-tool-use
   (let [directory (.toFile (java.nio.file.Files/createTempDirectory

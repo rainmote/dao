@@ -10,5 +10,9 @@
   {:ns agent.plugins.runtime
    :config {:max-steps 3
             :system-prompt "Reply briefly for the offline TUI demo."}}
-  {:ns agent.plugins.tui
-   :config {:root "." :screen :alternate :theme :midnight}}]}
+  {:ns agent.plugins.remote-registry}
+  {:ns agent.plugins.remote-api}
+  {:ns agent.plugins.tui-ink
+   :config {:command ["node" "apps/tui/dist/main.js"]
+            :theme "Qwen Dark"
+            :shutdown-timeout-ms 1500}}]}
