@@ -3,13 +3,35 @@
   {:ns agent.plugins.mock
    :config
    {:responses
-    [{:message {:role "assistant"
-                :content "TUI is ready. Ctrl+N inserts a newline; Enter submits."}
+    [{:message
+      {:role "assistant"
+       :content nil
+       :tool_calls
+       [{:id "mock-read"
+         :type "function"
+         :function {:name "read"
+                    :arguments "{\"path\":\"README.md\",\"limit\":8}"}}
+        {:id "mock-search"
+         :type "function"
+         :function {:name "grep"
+                    :arguments "{\"path\":\"apps/tui\",\"query\":\"ToolGroup\",\"limit\":4}"}}
+        {:id "mock-list"
+         :type "function"
+         :function {:name "ls"
+                    :arguments "{\"path\":\"apps/tui/components\",\"limit\":8}"}}]}
+      :finish-reason "tool_calls"
+      :usage {:total_tokens 24}}
+     {:message {:role "assistant"
+                :content "The TUI groups discovery tools into one Qwen-style summary."}
       :finish-reason "stop"
       :usage {:total_tokens 12}}]}}
+  {:ns agent.plugins.execution-world
+   :config {:root "."}}
+  {:ns agent.plugins.tools
+   :config {:max-read-chars 5000 :default-read-lines 40}}
   {:ns agent.plugins.runtime
    :config {:max-steps 3
-            :system-prompt "Reply briefly for the offline TUI demo."}}
+            :system-prompt "Use the supplied discovery tools, then reply briefly."}}
   {:ns agent.plugins.remote-registry}
   {:ns agent.plugins.remote-api}
   {:ns agent.plugins.tui-ink

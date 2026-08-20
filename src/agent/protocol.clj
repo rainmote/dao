@@ -23,7 +23,10 @@
       :session_id session-id
       :seq (:seq data)
       :event_id (:id data)
-      :run_id (or (:run_id data) (get-in data [:data :run_id]))
+      :run_id (or (:run-id data)
+                  (:run_id data)
+                  (get-in data [:data :run-id])
+                  (get-in data [:data :run_id]))
       :event (event-name (:type data))
       :durable true
       :at (:at data)
@@ -46,7 +49,8 @@
         ((:subscribe! session)
          (fn [event]
            (write-event! session-id (:type event) event)))]
-    (doseq [event [:session/event :llm/stream :tool.execution/update
+    (doseq [event [:session/event :llm/stream :tool.execution/confirming
+                   :tool.execution/start :tool.execution/update
                    :tool.execution/end
                    :approval/event :context/compacted
                    :context/compaction-fallback

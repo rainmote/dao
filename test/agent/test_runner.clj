@@ -30,7 +30,7 @@
             [clojure.string :as str]
             [clojure.test :refer [deftest is run-tests testing]]))
 
-(declare delete-tree!)
+(declare delete-tree! tool-call)
 
 (deftest reversible-kernel-effects
   (let [ctx (kernel/create-context)
@@ -167,9 +167,44 @@
                               (ns-resolve 'agent.plugins.tui-ink
                                           'live-events)))]
         (is (contains? live-events :ui/run-error))
+        (is (contains? live-events :tool.execution/confirming))
+        (is (contains? live-events :tool.execution/start))
         (is (not (contains? live-events :llm/stream))))
       (finally
         (kernel/dispose-all! ctx)))))
+
+(deftest ink-tui-child-defaults-color-and-production-with-env-override
+  (let [start-process! (var-get (ns-resolve 'agent.plugins.tui-ink
+                                            'start-process!))
+        node-script
+        (str "process.stdout.write(JSON.stringify({"
+             "nodeEnv:process.env.NODE_ENV||null,"
+             "term:process.env.TERM||null,"
+             "forceColor:process.env.FORCE_COLOR||null,"
+             "noColor:process.env.NO_COLOR||null}))")
+        read-env
+        (fn [config]
+          (let [process (start-process!
+                         (merge {:command ["node" "-e" node-script]} config))]
+            (try
+              (let [value (slurp (.getInputStream process))]
+                (.waitFor process)
+                (json/parse-string value true))
+              (finally
+                (when (.isAlive process) (.destroy process))))))]
+    (is (= {:nodeEnv "production"
+            :term "xterm-256color"
+            :forceColor "1"
+            :noColor nil}
+           (read-env {})))
+    (is (= {:nodeEnv "development"
+            :term "screen-256color"
+            :forceColor "0"
+            :noColor "1"}
+           (read-env {:env {"NODE_ENV" "development"
+                            "TERM" "screen-256color"
+                            "FORCE_COLOR" "0"
+                            "NO_COLOR" "1"}})))))
 
 (deftest ink-tui-rpc-reader-resolves-prompts-opened-by-command-handlers
   (let [node-script
@@ -219,6 +254,80 @@
       (finally
         (kernel/dispose-plugin! ctx :test/async-prompt-command)
         (kernel/dispose-all! ctx)))))
+
+(deftest ink-tui-turn-abort-cancels-an-open-tool-approval
+  (let [node-script
+        (str
+         "let buffer='';let abortAck=false;let aborted=false;let exiting=false;"
+         "const seen={confirming:false,resolved:false,end:false,result:false,step:false,start:false};"
+         "const timer=setTimeout(()=>process.exit(30),4000);"
+         "const send=value=>console.log(JSON.stringify(value));"
+         "const maybeExit=()=>{if(abortAck&&aborted&&!exiting){"
+         "if(seen.start||!seen.confirming||!seen.resolved||!seen.end||!seen.result||!seen.step)process.exit(31);"
+         "exiting=true;send({type:'request',id:'exit',method:'frontend.exit',params:{}});}};"
+         "process.stdin.setEncoding('utf8');"
+         "process.stdin.on('data',chunk=>{buffer+=chunk;"
+         "const lines=buffer.split('\\n');buffer=lines.pop();"
+         "for(const line of lines){if(!line)continue;const message=JSON.parse(line);"
+         "if(message.type==='ready'){send({type:'request',id:'submit',method:'turn.submit',params:{message:'approve'}});continue;}"
+         "if(message.type==='response'&&message.id==='submit'){if(!message.ok||!message.result.accepted)process.exit(32);continue;}"
+         "if(message.type==='response'&&message.id==='abort'){if(!message.ok||!message.result.aborted)process.exit(33);abortAck=true;maybeExit();continue;}"
+         "if(message.type==='response'&&message.id==='exit'){clearTimeout(timer);process.exit(message.ok?0:34);continue;}"
+         "if(message.type!=='event')continue;"
+         "if(message.event==='tool.execution/confirming')seen.confirming=true;"
+         "else if(message.event==='tool.execution/start')seen.start=true;"
+         "else if(message.event==='interaction/request'){send({type:'request',id:'abort',method:'turn.abort',params:{}});}"
+         "else if(message.event==='interaction/resolved'){if(message.data.cancelled!==true||message.data.decision!=='deny')process.exit(35);seen.resolved=true;}"
+         "else if(message.event==='tool.execution/end'){if(message.data.status!=='canceled'||message.data.cancelled!==true)process.exit(36);seen.end=true;}"
+         "else if(message.event==='tool/result'){if(message.data.status!=='canceled'||message.data.cancelled!==true)process.exit(37);seen.result=true;}"
+         "else if(message.event==='step/end'){if(message.data.aborted!==true)process.exit(38);seen.step=true;}"
+         "else if(message.event==='agent/aborted'&&message.durable===true){"
+         "if(typeof message.run_id!=='string'||!message.run_id)process.exit(39);"
+         "aborted=true;maybeExit();}"
+         "}});")
+        executed? (atom false)
+        ctx (plugin/boot!
+             {:plugins
+              [{:ns 'agent.plugins.session}
+               {:ns 'agent.plugins.mock
+                :config {:responses
+                         [{:message
+                           {:role "assistant" :content nil
+                            :tool_calls [(tool-call "approval-call" "danger" {})]}
+                           :finish-reason "tool_calls"}]}}
+               {:ns 'agent.plugins.remote-registry}
+               {:ns 'agent.plugins.approval :config {:mode :ask}}
+               {:ns 'agent.plugins.policy
+                :config {:approval-tools ["danger"]}}
+               {:ns 'agent.plugins.runtime :config {:max-steps 2}}
+               {:ns 'agent.plugins.remote-api}
+               {:ns 'agent.plugins.tui-ink
+                :config {:command ["node" "-e" node-script]
+                         :interaction-timeout-ms 2000
+                         :shutdown-timeout-ms 1000}}]})]
+    (try
+      (let [tool-ctx (kernel/plugin-context ctx :test/approval-abort-tool)]
+        (kernel/register-tool!
+         tool-ctx
+         {:name "danger"
+          :description "approval-gated test tool"
+          :parameters {:type "object" :additionalProperties false}
+          :execute (fn [_ _]
+                     (reset! executed? true)
+                     {:unexpected true})})
+        (is (nil? ((:run! (kernel/require-service
+                            ctx :frontend/interactive)))))
+        (let [events ((:events (kernel/require-service ctx :session/store)))
+              results (filterv #(= "tool/result" (:type %)) events)]
+          (is (false? @executed?))
+          (is (= ["approval-call"]
+                 (mapv #(get-in % [:data :call-id]) results)))
+          (is (= [:canceled] (mapv #(get-in % [:data :status]) results)))
+          (is (some #(and (= "step/end" (:type %))
+                          (true? (get-in % [:data :aborted])))
+                    events))
+          (is (some #(= "agent/aborted" (:type %)) events))))
+      (finally (kernel/dispose-all! ctx)))))
 
 (deftest remote-model-command-results-are-json-safe
   (let [sanitize (var-get #'remote-api/public-command-result)
@@ -686,7 +795,7 @@
         (is (empty? (:widgets registries))))
       (finally (kernel/dispose-all! ctx)))))
 
-(deftest model-rendering-and-live-tool-end-are-independent
+(deftest model-rendering-and-live-tool-lifecycle-are-independent
   (let [ctx (plugin/boot!
              {:plugins
               [{:ns 'agent.plugins.session}
@@ -704,6 +813,8 @@
                    :finish-reason "stop"}]}}
                {:ns 'agent.plugins.runtime}]})
         extension-ctx (kernel/plugin-context ctx :test/dual-render)
+        lifecycle (atom [])
+        started (atom [])
         ended (atom [])]
     (try
       (kernel/register-tool!
@@ -713,9 +824,15 @@
         :parameters {:type "object" :required ["value"]
                      :properties {"value" {:type "integer"}}
                      :additionalProperties false}
-        :execute (fn [{:keys [value]} _] {:value value})
+        :execute (fn [{:keys [value]} _]
+                   (swap! lifecycle conj :body)
+                   {:value value})
         :render-model (fn [_ value] (str "model:" (:value value)))
         :render-tui (fn [_ _] ["visual-only"])})
+      (kernel/on! extension-ctx :tool.execution/start
+                  (fn [_ event]
+                    (swap! lifecycle conj :start)
+                    (swap! started conj event)))
       (kernel/on! extension-ctx :tool.execution/end
                   (fn [_ event] (swap! ended conj event)))
       ((kernel/require-service ctx :agent/run) "go")
@@ -726,6 +843,11 @@
                                         ctx :session/store))))))))
       (is (= {:value 42} (:value (first @ended))))
       (is (:ok (first @ended)))
+      (is (= [:start :body] @lifecycle))
+      (is (= "render-1" (:call-id (first @started))))
+      (is (= "dual_render" (:name (first @started))))
+      (is (string? (:execution-id (first @started))))
+      (is (pos-int? (:started-at (first @started))))
       (finally (kernel/dispose-all! ctx)))))
 
 (deftest approval-can-use-a-tui-prompt-service
@@ -860,15 +982,27 @@
                  {:ns 'agent.plugins.policy
                   :config {:approval-tools ["danger"]}}]})]
       (try
-        (let [result (kernel/waterfall
+        (let [confirming (atom [])
+              observer (kernel/plugin-context ctx :test/approval-confirming)
+              _ (kernel/on! observer :tool.execution/confirming
+                            (fn [_ event] (swap! confirming conj event)))
+              result (kernel/waterfall
                       ctx :tool/pre-execute
                       {:execution {:name "danger"
+                                   :call-id "call-1"
                                    :token "execution-1"
                                    :arguments {:value 1}}}
                       #(assoc % :decision :allow))
               events ((:events (kernel/require-service ctx :session/store)))]
           (is (= :deny (:decision result)))
-          (is (some #(= "approval/decision" (:type %)) events)))
+          (is (= [{:execution-id "execution-1"
+                   :call-id "call-1"
+                   :name "danger"}]
+                 @confirming))
+          (is (some #(and (= "approval/decision" (:type %))
+                          (= "call-1" (get-in % [:data :call-id]))
+                          (= "danger" (get-in % [:data :name])))
+                    events)))
         (finally (kernel/dispose-all! ctx))))))
 
 (deftest cancellation-closes-a-blocked-stream
@@ -1543,6 +1677,137 @@
             (is (= 1 (count ((:messages store)))))))
         (finally (kernel/dispose-all! ctx))))))
 
+(deftest late-no-tool-response-closes-the-step-as-aborted
+  (let [started (promise)
+        release (promise)
+        ctx (plugin/boot!
+             {:plugins
+              [{:ns 'agent.plugins.session}
+               {:ns 'agent.plugins.mock
+                :config
+                {:generate
+                 (fn [_]
+                   (deliver started true)
+                   @release
+                   {:message {:role "assistant" :content "late final"}
+                    :finish-reason "stop"})}}
+               {:ns 'agent.plugins.runtime}]})]
+    (try
+      (let [session (kernel/require-service ctx :agent/session)
+            store (kernel/require-service ctx :session/store)
+            {:keys [result]} ((:submit! session) "block then stop")]
+        (is (= true (deref started 1000 :timeout)))
+        (is (true? ((:abort! session))))
+        (deliver release true)
+        (let [{:keys [ok error]} (deref result 1000 :timeout)
+              events ((:events store))
+              step-end (first (filter #(= "step/end" (:type %)) events))
+              event-types (mapv :type events)]
+          (is (false? ok))
+          (is (:cancelled (ex-data error)))
+          (is (= {:step 1 :tool-count 0 :aborted true}
+                 (:data step-end)))
+          (is (not-any? #(and (= "message" (:type %))
+                              (= "assistant"
+                                 (get-in % [:data :message :role]))
+                              (= "late final"
+                                 (get-in % [:data :message :content])))
+                        events))
+          (is (some #(= "agent/aborted" (:type %)) events))
+          (is (< (.indexOf event-types "step/end")
+                 (.indexOf event-types "agent/aborted")))))
+      (finally
+        (deliver release true)
+        (kernel/dispose-all! ctx)))))
+
+(deftest late-tool-call-responses-are-dropped-after-abort
+  (doseq [finish-reason ["tool_calls" "length"]]
+    (testing (str "finish reason " finish-reason)
+      (let [started (promise)
+            release (promise)
+            late-call (tool-call (str "late-" finish-reason)
+                                 "late_tool"
+                                 {:value finish-reason})
+            ctx (plugin/boot!
+                 {:plugins
+                  [{:ns 'agent.plugins.session}
+                   {:ns 'agent.plugins.mock
+                    :config
+                    {:generate
+                     (fn [_]
+                       (deliver started true)
+                       @release
+                       {:message {:role "assistant"
+                                  :content "late tool response"
+                                  :tool_calls [late-call]}
+                        :finish-reason finish-reason})}}
+                   {:ns 'agent.plugins.runtime}]})]
+        (try
+          (let [session (kernel/require-service ctx :agent/session)
+                store (kernel/require-service ctx :session/store)
+                {:keys [result]} ((:submit! session) "block then return a tool")]
+            (is (= true (deref started 1000 :timeout)))
+            (is (true? ((:abort! session))))
+            (deliver release true)
+            (let [{:keys [ok error]} (deref result 1000 :timeout)
+                  events ((:events store))
+                  event-types (mapv :type events)
+                  step-end (first (filter #(= "step/end" (:type %)) events))]
+              (is (false? ok))
+              (is (:cancelled (ex-data error)))
+              (is (= {:step 1 :tool-count 0 :aborted true}
+                     (:data step-end)))
+              (is (not-any? #{"tool/call" "tool/result"} event-types))
+              (is (not-any? #(and (= "message" (:type %))
+                                  (= "assistant"
+                                     (get-in % [:data :message :role])))
+                            events))
+              (is (= 1 (count ((:messages store)))))
+              (is (< (.indexOf event-types "step/end")
+                     (.indexOf event-types "agent/aborted")))))
+          (finally
+            (deliver release true)
+            (kernel/dispose-all! ctx)))))))
+
+(deftest late-provider-error-after-abort-is-canonical-cancellation
+  (let [started (promise)
+        release (promise)
+        ctx (plugin/boot!
+             {:plugins
+              [{:ns 'agent.plugins.session}
+               {:ns 'agent.plugins.mock
+                :config
+                {:generate
+                 (fn [_]
+                   (deliver started true)
+                   @release
+                   (throw (ex-info "late provider 400" {:status 400})))}}
+               {:ns 'agent.plugins.runtime}]})]
+    (try
+      (let [session (kernel/require-service ctx :agent/session)
+            store (kernel/require-service ctx :session/store)
+            {:keys [result]} ((:submit! session) "block then fail")]
+        (is (= true (deref started 1000 :timeout)))
+        (is (true? ((:abort! session))))
+        (deliver release true)
+        (let [{:keys [ok error]} (deref result 1000 :timeout)
+              events ((:events store))
+              event-types (mapv :type events)
+              step-end (first (filter #(= "step/end" (:type %)) events))]
+          (is (false? ok))
+          (is (:cancelled (ex-data error)))
+          (is (= {:step 1 :tool-count 0 :aborted true}
+                 (:data step-end)))
+          (is (not-any? #{"agent/error" "tool/call" "tool/result"}
+                        event-types))
+          (is (some #{"agent/aborted"} event-types))
+          (is (= 1 (count ((:messages store)))))
+          (is (< (.indexOf event-types "step/end")
+                 (.indexOf event-types "agent/aborted")))))
+      (finally
+        (deliver release true)
+        (kernel/dispose-all! ctx)))))
+
 (defn- batch-config [tool-calls]
   {:plugins
    [{:ns 'agent.plugins.session}
@@ -1565,6 +1830,266 @@
                (swap! completed conj name)
                {:name name})}
     execution-mode (assoc :execution-mode execution-mode)))
+
+(deftest parallel-tool-end-is-live-while-durable-results-stay-model-ordered
+  (let [calls [(tool-call "slow-call" "slow_tool" {})
+               (tool-call "fast-call" "fast_tool" {})]
+        release-slow (promise)
+        fast-ended (promise)
+        live-ends (atom [])
+        ctx (plugin/boot! (batch-config calls))]
+    (try
+      (let [tool-ctx (kernel/plugin-context ctx :test/completion-order)
+            observer (kernel/plugin-context ctx :test/completion-events)
+            session (kernel/require-service ctx :agent/session)
+            store (kernel/require-service ctx :session/store)]
+        (kernel/register-tool!
+         tool-ctx
+         {:name "slow_tool"
+          :description "blocked slow tool"
+          :parameters {:type "object" :additionalProperties false}
+          :execute (fn [_ _]
+                     @release-slow
+                     {:speed :slow})})
+        (kernel/register-tool!
+         tool-ctx
+         {:name "fast_tool"
+          :description "immediate fast tool"
+          :parameters {:type "object" :additionalProperties false}
+          :execute (fn [_ _] {:speed :fast})})
+        (kernel/on! observer :tool.execution/end
+                    (fn [_ event]
+                      (swap! live-ends conj event)
+                      (when (= "fast-call" (:call-id event))
+                        (deliver fast-ended true))))
+        (let [{:keys [result]} ((:submit! session) "completion order")]
+          (is (= true (deref fast-ended 1000 :timeout)))
+          (is (= ["fast-call"] (mapv :call-id @live-ends)))
+          (is (empty? (filter #(= "tool/result" (:type %))
+                              ((:events store)))))
+          (deliver release-slow true)
+          (let [{:keys [ok]} (deref result 2000 :timeout)
+                events ((:events store))
+                durable-results (filterv #(= "tool/result" (:type %))
+                                          events)
+                tool-messages (filterv #(= "tool" (:role %))
+                                       ((:messages store)))]
+            (is ok)
+            (is (= ["fast-call" "slow-call"]
+                   (mapv :call-id @live-ends)))
+            (is (= ["slow-call" "fast-call"]
+                   (mapv #(get-in % [:data :call-id]) durable-results)))
+            (is (= ["slow-call" "fast-call"]
+                   (mapv :tool_call_id tool-messages))))))
+      (finally
+        (deliver release-slow true)
+        (kernel/dispose-all! ctx)))))
+
+(deftest preflight-errors-end-before-a-later-approval-resolves
+  (let [calls [(tool-call "unknown-call" "missing_tool" {})
+               (tool-call "invalid-call" "validated_tool" {})
+               (tool-call "approval-call" "danger" {})]
+        approval-opened (promise)
+        approval-decision (promise)
+        live-ends (atom [])
+        ctx (plugin/boot!
+             {:plugins
+              [{:ns 'agent.plugins.session}
+               {:ns 'agent.plugins.mock
+                :config {:responses
+                         [{:message {:role "assistant" :content nil
+                                     :tool_calls calls}
+                           :finish-reason "tool_calls"}
+                          {:message {:role "assistant" :content "done"}
+                           :finish-reason "stop"}]}}
+               {:ns 'agent.plugins.approval :config {:mode :ask}}
+               {:ns 'agent.plugins.policy
+                :config {:approval-tools ["danger"]}}
+               {:ns 'agent.plugins.runtime :config {:max-steps 3}}]})]
+    (try
+      (let [prompt-ctx (kernel/plugin-context ctx :test/blocked-approval)
+            tool-ctx (kernel/plugin-context ctx :test/preflight-tools)
+            observer (kernel/plugin-context ctx :test/preflight-events)
+            session (kernel/require-service ctx :agent/session)
+            store (kernel/require-service ctx :session/store)]
+        (kernel/register-service!
+         prompt-ctx :ui/prompt
+         {:active? (constantly true)
+          :select! (fn [prompt]
+                     (deliver approval-opened prompt)
+                     @approval-decision)})
+        (kernel/register-tool!
+         tool-ctx
+         {:name "validated_tool"
+          :description "requires an argument"
+          :parameters {:type "object"
+                       :required ["value"]
+                       :properties {"value" {:type "integer"}}
+                       :additionalProperties false}
+          :execute (fn [_ _] {:unexpected true})})
+        (kernel/register-tool!
+         tool-ctx
+         {:name "danger"
+          :description "approval-gated tool"
+          :parameters {:type "object" :additionalProperties false}
+          :execute (fn [_ _] {:approved true})})
+        (kernel/on! observer :tool.execution/end
+                    (fn [_ event] (swap! live-ends conj event)))
+        (let [{:keys [result]} ((:submit! session) "preflight timing")]
+          (is (map? (deref approval-opened 1000 :timeout)))
+          (is (= ["unknown-call" "invalid-call"]
+                 (mapv :call-id @live-ends)))
+          (is (every? #(= :error (:status %)) @live-ends))
+          (is (empty? (filter #(= "tool/result" (:type %))
+                              ((:events store)))))
+          (deliver approval-decision :allow)
+          (let [{:keys [ok]} (deref result 2000 :timeout)
+                durable-results (filterv #(= "tool/result" (:type %))
+                                          ((:events store)))]
+            (is ok)
+            (is (= ["unknown-call" "invalid-call" "approval-call"]
+                   (mapv :call-id @live-ends)))
+            (is (= 3 (count @live-ends)))
+            (is (= ["unknown-call" "invalid-call" "approval-call"]
+                   (mapv #(get-in % [:data :call-id]) durable-results))))))
+      (finally
+        (deliver approval-decision :deny)
+        (kernel/dispose-all! ctx)))))
+
+(deftest sequential-tool-abort-terminalizes-running-and-pending-calls
+  (let [calls [(tool-call "first-call" "first_tool" {})
+               (tool-call "second-call" "second_tool" {})]
+        first-started (promise)
+        second-executed? (atom false)
+        starts (atom [])
+        ends (atom [])
+        ctx (plugin/boot! (batch-config calls))]
+    (try
+      (let [tool-ctx (kernel/plugin-context ctx :test/sequential-cancel)
+            observer (kernel/plugin-context ctx :test/sequential-events)
+            session (kernel/require-service ctx :agent/session)
+            store (kernel/require-service ctx :session/store)]
+        (kernel/register-tool!
+         tool-ctx
+         {:name "first_tool"
+          :description "cooperatively blocked first tool"
+          :execution-mode :sequential
+          :parameters {:type "object" :additionalProperties false}
+          :execute (fn [_ {:keys [cancel-token]}]
+                     (deliver first-started true)
+                     (loop []
+                       (cancellation/throw-if-cancelled! cancel-token)
+                       (Thread/sleep 5)
+                       (recur)))})
+        (kernel/register-tool!
+         tool-ctx
+         {:name "second_tool"
+          :description "must remain unexecuted"
+          :parameters {:type "object" :additionalProperties false}
+          :execute (fn [_ _]
+                     (reset! second-executed? true)
+                     {:unexpected true})})
+        (kernel/on! observer :tool.execution/start
+                    (fn [_ event] (swap! starts conj event)))
+        (kernel/on! observer :tool.execution/end
+                    (fn [_ event] (swap! ends conj event)))
+        (let [{:keys [result]} ((:submit! session) "cancel tools")]
+          (is (= true (deref first-started 1000 :timeout)))
+          (is (= ["first-call" "second-call"]
+                 (->> ((:events store))
+                      (filter #(= "tool/call" (:type %)))
+                      (mapv #(get-in % [:data :call-id])))))
+          (is (true? ((:abort! session))))
+          (let [{:keys [ok error]} (deref result 2000 :timeout)
+                events ((:events store))
+                durable-results (filterv #(= "tool/result" (:type %))
+                                          events)
+                event-types (mapv :type events)]
+            (is (false? ok))
+            (is (:cancelled (ex-data error)))
+            (is (= ["first-call"] (mapv :call-id @starts)))
+            (is (= ["first-call" "second-call"]
+                   (mapv :call-id @ends)))
+            (is (every? #(and (= :canceled (:status %))
+                              (true? (:cancelled %)))
+                        @ends))
+            (is (= ["first-call" "second-call"]
+                   (mapv #(get-in % [:data :call-id]) durable-results)))
+            (is (every? #(and (= :canceled (get-in % [:data :status]))
+                              (true? (get-in % [:data :cancelled])))
+                        durable-results))
+            (is (false? @second-executed?))
+            (is (true? (get-in (first (filter #(= "step/end" (:type %))
+                                              events))
+                               [:data :aborted])))
+            (is (< (.indexOf event-types "step/end")
+                   (.indexOf event-types "agent/aborted"))))))
+      (finally (kernel/dispose-all! ctx)))))
+
+(deftest approval-wait-abort-closes-the-entire-declared-tool-batch
+  (let [calls [(tool-call "approval-first" "danger" {})
+               (tool-call "approval-second" "danger" {})]
+        prompt-opened (promise)
+        executed? (atom false)
+        ends (atom [])
+        ctx (plugin/boot!
+             {:plugins
+              [{:ns 'agent.plugins.session}
+               {:ns 'agent.plugins.mock
+                :config {:responses
+                         [{:message {:role "assistant" :content nil
+                                     :tool_calls calls}
+                           :finish-reason "tool_calls"}]}}
+               {:ns 'agent.plugins.approval :config {:mode :ask}}
+               {:ns 'agent.plugins.policy
+                :config {:approval-tools ["danger"]}}
+               {:ns 'agent.plugins.runtime :config {:max-steps 2}}]})]
+    (try
+      (let [prompt-ctx (kernel/plugin-context ctx :test/cancellable-approval)
+            tool-ctx (kernel/plugin-context ctx :test/approval-tool)
+            observer (kernel/plugin-context ctx :test/approval-end)
+            session (kernel/require-service ctx :agent/session)
+            store (kernel/require-service ctx :session/store)]
+        (kernel/register-service!
+         prompt-ctx :ui/prompt
+         {:active? (constantly true)
+          :select! (fn [{:keys [cancel-token] :as prompt}]
+                     (deliver prompt-opened prompt)
+                     (loop []
+                       (if (cancellation/cancelled? cancel-token)
+                         :deny
+                         (do (Thread/sleep 5) (recur)))))})
+        (kernel/register-tool!
+         tool-ctx
+         {:name "danger"
+          :description "approval-gated tool"
+          :parameters {:type "object" :additionalProperties false}
+          :execute (fn [_ _]
+                     (reset! executed? true)
+                     {:unexpected true})})
+        (kernel/on! observer :tool.execution/end
+                    (fn [_ event] (swap! ends conj event)))
+        (let [{:keys [result]} ((:submit! session) "wait for approval")
+              prompt (deref prompt-opened 1000 :timeout)]
+          (is (map? prompt))
+          (is (some? (:cancel-token prompt)))
+          (is (= ["approval-first" "approval-second"]
+                 (->> ((:events store))
+                      (filter #(= "tool/call" (:type %)))
+                      (mapv #(get-in % [:data :call-id])))))
+          (is (true? ((:abort! session))))
+          (let [{:keys [ok error]} (deref result 2000 :timeout)
+                durable-results (filterv #(= "tool/result" (:type %))
+                                          ((:events store)))]
+            (is (false? ok))
+            (is (:cancelled (ex-data error)))
+            (is (= ["approval-first" "approval-second"]
+                   (mapv :call-id @ends)))
+            (is (every? :cancelled @ends))
+            (is (= ["approval-first" "approval-second"]
+                   (mapv #(get-in % [:data :call-id]) durable-results)))
+            (is (false? @executed?)))))
+      (finally (kernel/dispose-all! ctx)))))
 
 (deftest deterministic-parallel-tool-batches
   (let [calls [(tool-call "slow-a" "slow_a" {})
@@ -2505,6 +3030,75 @@
         (is (every? #(= 1 (:version %)) lines))
         (is (= "result" (:type (last lines))))
         (is (some #(= "agent.turn/start" (:event %)) lines)))
+      (finally (api/dispose! ctx)))))
+
+(deftest versioned-json-projection-includes-tool-lifecycle-events
+  (let [ctx (api/boot {:plugins [{:ns 'agent.plugins.session}
+                                 {:ns 'agent.plugins.mock
+                                  :config {:responses []}}
+                                 {:ns 'agent.plugins.runtime}]})
+        output (java.io.StringWriter.)]
+    (try
+      (binding [*out* output]
+        (let [dispose (protocol/subscribe-json! ctx)]
+          (try
+            (kernel/emit! ctx :tool.execution/confirming
+                          {:call-id "call-1"
+                           :name "read"
+                           :execution-id "execution-1"})
+            (kernel/emit! ctx :tool.execution/start
+                          {:call-id "call-1"
+                           :name "read"
+                           :execution-id "execution-1"
+                           :started-at 1777000000123})
+            (finally (dispose)))))
+      (let [events (map #(json/parse-string % true)
+                        (str/split-lines (str output)))
+            confirming (first
+                        (filter #(= "tool.execution/confirming" (:event %))
+                                events))
+            start (first (filter #(= "tool.execution/start" (:event %))
+                                 events))]
+        (is (= false (:durable confirming)))
+        (is (= "execution-1" (get-in confirming [:data :execution-id])))
+        (is (= false (:durable start)))
+        (is (= "execution-1" (get-in start [:data :execution-id])))
+        (is (= 1777000000123 (get-in start [:data :started-at]))))
+      (finally (api/dispose! ctx)))))
+
+(deftest versioned-json-projection-supports-durable-run-id-spellings
+  (let [ctx (api/boot {:plugins [{:ns 'agent.plugins.session}
+                                 {:ns 'agent.plugins.mock
+                                  :config {:responses []}}
+                                 {:ns 'agent.plugins.runtime}]})
+        output (java.io.StringWriter.)
+        durable-events
+        [{:id "event-kebab" :seq 1 :type "agent/error"
+          :run-id "outer-kebab" :data {}}
+         {:id "event-snake" :seq 2 :type "agent/error"
+          :run_id "outer-snake" :data {}}
+         {:id "data-kebab" :seq 3 :type "agent/error"
+          :data {:run-id "inner-kebab"}}
+         {:id "data-snake" :seq 4 :type "agent/error"
+          :data {:run_id "inner-snake"}}
+         {:id "priority" :seq 5 :type "agent/error"
+          :run-id "outer-kebab-first"
+          :run_id "outer-snake-second"
+          :data {:run-id "inner-kebab-third"
+                 :run_id "inner-snake-fourth"}}]]
+    (try
+      (binding [*out* output]
+        (let [dispose (protocol/subscribe-json! ctx)]
+          (try
+            (doseq [event durable-events]
+              (kernel/emit! ctx :session/event event))
+            (finally (dispose)))))
+      (let [events (map #(json/parse-string % true)
+                        (str/split-lines (str output)))]
+        (is (every? :durable events))
+        (is (= ["outer-kebab" "outer-snake" "inner-kebab" "inner-snake"
+                "outer-kebab-first"]
+               (mapv :run_id events))))
       (finally (api/dispose! ctx)))))
 
 (deftest lsp-plugin-contract-and-document-synchronization

@@ -51,6 +51,7 @@
     ((:select! prompt)
      {:title (str "Approve tool " (:tool request) "?")
       :message (pr-str (select-keys request [:target :arguments]))
+      :cancel-token (:cancel-token request)
       :items [{:label "Allow once" :value :allow}
               {:label "Allow for session" :value :allow-session}
               {:label "Deny" :value :deny}]
@@ -84,7 +85,8 @@
             (when (= raw :allow-session)
               (swap! session-grants conj key))
             (kernel/emit! ctx :approval/event
-                          (assoc request :mode mode :decision decision
+                          (assoc (dissoc request :cancel-token)
+                                 :mode mode :decision decision
                                  :session-grant (= raw :allow-session)))
             decision))))
      nil)})

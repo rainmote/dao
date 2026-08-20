@@ -122,11 +122,16 @@ bb tui-build
 bb agent --config examples/tui-mock.edn --mode tui
 ```
 
-同一次工具执行只显示一组紧凑状态行：运行中展示参数和最新输出，完成后原地更新状态、
-耗时与结果摘要；`Ctrl+O` 可展开完整细节。
+Ink 子进程默认使用 `TERM=xterm-256color`、`FORCE_COLOR=1` 和
+`NODE_ENV=production`，并移除从宿主继承的 `NO_COLOR`。因此 Ghostty 不需要再手工补环境变量；
+生产模式也会避免长时间动画触发 Node 的 `MaxPerformanceEntryBufferExceededWarning`。
 
-`Enter` 在空闲时提交、运行中 steer；`Alt+Enter` 在运行中排入 follow-up，空闲时插入
-换行；`Ctrl+N`、`Ctrl+Enter` 或 `Shift+Enter` 也可换行；`Esc`/`Ctrl+C` 中止当前运行，
+同一次模型响应里的 read/search/list 工具会聚合成一条 Qwen 风格语义摘要，例如
+`Searching ToolGroup, reading README.md, listing apps/tui…`；运行中的状态图标和底部短语会动态
+变化，完成后整句自动切换为过去时。命令、编辑等动作型工具仍逐条保留，`Ctrl+O` 可展开完整细节。
+
+`Enter` 在空闲时提交、运行中 steer；`Ctrl+Q` 在运行中排入 follow-up；`Alt+Enter`、
+`Ctrl+N`、`Ctrl+Enter` 或 `Shift+Enter` 插入换行；`Esc`/`Ctrl+C` 中止当前运行，
 `Ctrl+O` 展开或折叠 reasoning 与工具详情，`Tab` 补全 slash command，
 `PageUp/PageDown` 查看历史。向上滚动后，新消息不会强制把视口拉回底部。`/model`、
 `/sessions` 和 `/theme` 打开对应选择器。完整安装、按键、命令、TTY/JSONL 架构与旧版
@@ -155,7 +160,7 @@ bb agent --help
 ## 运行中控制
 
 交互模式不再被一次生成同步锁死。模型或工具运行时可以继续输入：`Enter` 会 steer
-当前运行，`Alt+Enter` 会排成 follow-up，也可以用 slash command 显式控制：
+当前运行，`Ctrl+Q` 会排成 follow-up，也可以用 slash command 显式控制：
 
 ```text
 /steer 先不要改文件，先解释根因

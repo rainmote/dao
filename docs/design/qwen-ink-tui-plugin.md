@@ -69,7 +69,9 @@ The current surface includes:
 - full-width horizontal composer rules, `> ` prompt, and software cursor;
 - dialogs that replace the composer/footer control region while open;
 - Markdown assistant rendering;
-- grouped, collapsible, chrome-free tool execution rows;
+- per-model-step tool batches with one mixed search/read/list sentence, Qwen display names for action tools, and full `Ctrl+O` detail;
+- six-state pending/confirming/running/success/error/canceled projection with exactly-once live completion and model-ordered durable results;
+- animated response/tool indicators, elapsed time, phrase rotation, and a static approval-wait row;
 - streaming assistant and reasoning display;
 - multiline Unicode-safe input and software cursor;
 - slash completion and input history;
@@ -79,7 +81,7 @@ The current surface includes:
 - snapshot replay and live event deduplication;
 - JSON-safe status, widget, and notification projection;
 - host-side registered shortcut invocation over the remote method boundary;
-- measured, bounded long-history virtualization and scroll-follow behavior.
+- measured, bounded long-history virtualization and scroll-follow behavior;
 - Qwen Code's built-in theme registry, live highlight preview, cancel rollback,
   and host-synchronized theme selection.
 
@@ -104,6 +106,8 @@ frontend-neutral prompt boundary.
 - Plugin disposal closes subscriptions, asks the UI to shut down, restores the
   terminal, and then terminates a child that did not exit.
 - stdout remains protocol-only; diagnostics use stderr.
+- The child defaults to production Ink rendering with `TERM=xterm-256color`
+  and `FORCE_COLOR=1`, while explicit plugin `:env` values remain authoritative.
 
 ## Verification
 

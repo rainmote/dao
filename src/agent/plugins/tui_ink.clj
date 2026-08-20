@@ -4,7 +4,8 @@
   The child process owns the terminal. Its stdin/stdout are reserved for a
   versioned, line-delimited JSON protocol, so this plugin never rebinds or
   consumes the worker's global stdin/stdout."
-  (:require [agent.kernel :as kernel]
+  (:require [agent.cancellation :as cancellation]
+            [agent.kernel :as kernel]
             [agent.protocol :as protocol]
             [agent.schema :as schema]
             [cheshire.core :as json]
@@ -22,7 +23,8 @@
 ;; only the latter as its canonical streaming text source, otherwise one model
 ;; delta is appended once and then observed again in the complete partial text.
 (def ^:private live-events
-  [:session/event :tool.execution/update :tool.execution/end
+  [:session/event :tool.execution/confirming :tool.execution/start
+   :tool.execution/update :tool.execution/end
    :approval/event :context/compacted :context/compaction-fallback
    :interaction/request :interaction/resolved :remote/run-result
    :llm/model-selected :subagent/provider-added :subagent/provider-removed
@@ -45,7 +47,10 @@
    :session_id session-id
    :seq (:seq event)
    :event_id (:id event)
-   :run_id (or (:run_id event) (get-in event [:data :run_id]))
+   :run_id (or (:run-id event)
+               (:run_id event)
+               (get-in event [:data :run-id])
+               (get-in event [:data :run_id]))
    :event (event-name (:type event))
    :durable true
    :at (:at event)
@@ -100,6 +105,14 @@
           (throw (ex-info "Ink TUI :cwd must be a directory"
                           {:cwd (str directory)})))
         (.directory builder directory)))
+    ;; Child-only defaults keep Ink on its production renderer and preserve
+    ;; Qwen's 256-color palette even when the host shell exports NO_COLOR.
+    ;; Explicit plugin :env entries are applied afterwards and remain
+    ;; authoritative for development and diagnostics.
+    (.remove (.environment builder) "NO_COLOR")
+    (.put (.environment builder) "TERM" "xterm-256color")
+    (.put (.environment builder) "FORCE_COLOR" "1")
+    (.put (.environment builder) "NODE_ENV" "production")
     (doseq [[key value] env]
       (.put (.environment builder) (str key) (str value)))
     ;; stdout is protocol output; only diagnostics may reach the host terminal.
@@ -539,17 +552,29 @@
                           :completion completion}]
                (swap! pending assoc id entry)
                (kernel/emit! ctx :interaction/request public-request)
-               (let [resolved (deref completion timeout-ms ::timeout)
-                     timed-out? (= ::timeout resolved)
-                     result (if timed-out? (timeout-value entry) resolved)]
-                 (swap! pending dissoc id)
-                 (kernel/emit! ctx :interaction/resolved
-                               (cond-> {:id id :kind kind
-                                        :value result
-                                        :cancelled (nil? result)
-                                        :timed-out timed-out?}
-                                 approval? (assoc :decision result)))
-                 result)))
+               (let [dispose-cancel
+                     (cancellation/on-cancel!
+                      (:cancel-token prompt)
+                      #(deliver completion ::cancelled))]
+                 (try
+                   (let [resolved (deref completion timeout-ms ::timeout)
+                         cancelled? (= ::cancelled resolved)
+                         timed-out? (= ::timeout resolved)
+                         result (cond
+                                  cancelled? (when approval? :deny)
+                                  timed-out? (timeout-value entry)
+                                  :else resolved)]
+                     (kernel/emit! ctx :interaction/resolved
+                                   (cond-> {:id id :kind kind
+                                            :value result
+                                            :cancelled (or cancelled?
+                                                           (nil? result))
+                                            :timed-out timed-out?}
+                                     approval? (assoc :decision result)))
+                     result)
+                   (finally
+                     (dispose-cancel)
+                     (swap! pending dissoc id))))))
            select! #(request! :select %)
            confirm!
            #(request! :confirm

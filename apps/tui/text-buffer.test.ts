@@ -180,7 +180,7 @@ function ComposerHarness({
   });
 }
 
-test('composer completes slash commands and routes busy Enter modes', async () => {
+test('composer completes slash commands and routes Qwen busy Enter/Ctrl+Q modes', async () => {
   const submissions: Array<[string, ComposerSubmitOptions]> = [];
   const view = render(
     createElement(ComposerHarness, {
@@ -205,9 +205,16 @@ test('composer completes slash commands and routes busy Enter modes', async () =
 
   view.stdin.write('later');
   await flushInput();
-  view.stdin.write('\u001b\r');
+  view.stdin.write('\u0011');
   await flushInput();
   assert.deepEqual(submissions[1], ['later', { deferUntilIdle: true }]);
+
+  view.stdin.write('line one');
+  await flushInput();
+  view.stdin.write('\u001b\r');
+  await flushInput();
+  assert.match(view.lastFrame() ?? '', /line one/);
+  assert.equal(submissions.length, 2);
   view.unmount();
 });
 

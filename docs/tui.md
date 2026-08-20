@@ -96,6 +96,12 @@ bb test
 - `:shutdown-timeout-ms`：等待前端退出后再强制终止的时间。
 - `:interaction-timeout-ms`：UI prompt 等待用户响应的时间；默认 300000ms。
 
+插件启动 Node 子进程时默认设置 `TERM=xterm-256color`、`FORCE_COLOR=1` 和
+`NODE_ENV=production`，并先移除从宿主继承的 `NO_COLOR`。这让 Ghostty 等终端稳定启用
+Qwen 的 256 色语义色，同时避免 React/Ink 开发渲染器长期累积 performance measures 后出现
+`MaxPerformanceEntryBufferExceededWarning`。显式 `:env` 最后应用，因而仍可用
+`{:env {"FORCE_COLOR" "0" "NODE_ENV" "development"}}` 覆盖默认值进行诊断。
+
 一个 profile 必须只配置一个提供 `:frontend/interactive` 的 TUI 插件，并且 Ink 插件之前
 必须已有 `agent.plugins.remote-registry` 与 `agent.plugins.remote-api`。默认 `agent.edn` 和
 `examples/tui-mock.edn` 已按此顺序配置。
@@ -138,8 +144,8 @@ turn，并把尚未处理的审批安全地解析为 deny。
 | 按键 | 当前行为 |
 |---|---|
 | `Enter` | 空闲时提交；运行中立即 steer |
-| `Alt+Enter` | 运行中加入 follow-up；空闲时插入换行 |
-| `Ctrl+N` / `Ctrl+Enter` / `Shift+Enter` | 插入换行 |
+| `Ctrl+Q` | 运行中加入下一轮 follow-up 队列 |
+| `Alt+Enter` / `Ctrl+N` / `Ctrl+Enter` / `Shift+Enter` | 插入换行 |
 | `Esc` | 运行中 abort；空闲时清空编辑区 |
 | `Ctrl+C` | 运行中 abort；空闲时清空并提示，500ms 内再按一次退出 |
 | `Ctrl+D` | 空编辑区退出；否则向前删除 |
@@ -242,6 +248,10 @@ profile 中移除 `agent.plugins.tui-ink`，改为：
 
 - `Cannot find module ... apps/tui/dist/main.js`：运行 `npm install` 和 `bb tui-build`。
 - Node 版本错误或 Ink 无法加载：确认 `node --version` 至少为 22.12。
+- 界面仍然没有颜色：确认 profile 没有通过 `:env` 把 `FORCE_COLOR` 覆盖为 `0`；默认启动命令
+  不需要额外设置 Ghostty 环境变量。
+- 出现 `MaxPerformanceEntryBufferExceededWarning`：确认没有通过 `:env` 把 `NODE_ENV`
+  覆盖成 `development`，并重新运行 `bb tui-build` 后启动。
 - `could not open /dev/tty`、界面没有尺寸或无法读取键盘：从真实交互终端启动，不要把 TUI
   放进无 controlling TTY 的 pipe/CI。
 - 前端工作目录不是仓库根：给 `:command` 使用绝对 entrypoint，或配置正确的 `:cwd`。

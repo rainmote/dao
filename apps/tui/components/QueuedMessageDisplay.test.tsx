@@ -21,7 +21,7 @@ test('shows three compact queue previews, overflow, and the follow-up hint', () 
   assert.match(frame, /third/);
   assert.doesNotMatch(frame, /hidden fourth/);
   assert.match(frame, /\.\.\. \(\+1 more\)/);
-  assert.match(frame, /Alt\+Enter to queue a follow-up/);
+  assert.match(frame, /Ctrl\+Q to queue/);
   view.unmount();
 });
 

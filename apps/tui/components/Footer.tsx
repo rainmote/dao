@@ -38,21 +38,6 @@ function contextLabel(
   return { label: `${percentageLabel}${suffix}`, overLimit: percentage > 1 };
 }
 
-function phaseColor(phase: string, busy: boolean): string {
-  if (phase === 'error') return qwenTheme.status.error;
-  if (
-    phase === 'retry' ||
-    phase === 'compacting' ||
-    phase === 'loading' ||
-    phase === 'exiting'
-  ) {
-    return qwenTheme.status.warning;
-  }
-  if (busy) return qwenTheme.text.link;
-  if (phase === 'idle') return qwenTheme.status.success;
-  return qwenTheme.text.secondary;
-}
-
 function inferredBusy(phase: string | undefined): boolean {
   return Boolean(
     phase && !['idle', 'error', 'loading', 'exiting'].includes(phase),
@@ -80,19 +65,13 @@ export function Footer({
   const leftText = warning
     ? warning
     : isBusy
-      ? 'Enter steer · Alt+Enter follow-up · Ctrl+C/Esc abort'
+      ? 'Enter to steer · Ctrl+Q to queue'
       : hint;
   const contextInfo = context === undefined
     ? undefined
     : contextLabel(context, terminalWidth);
   const rightItems: Array<{ key: string; node: ReactNode }> = [];
 
-  if (phase) {
-    rightItems.push({
-      key: 'phase',
-      node: <Text color={phaseColor(phase, isBusy)}>{phase}</Text>,
-    });
-  }
   if (contextInfo) {
     rightItems.push({
       key: 'context',

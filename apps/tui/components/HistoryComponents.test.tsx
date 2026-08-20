@@ -4,7 +4,7 @@ import { Text } from 'ink';
 import { render } from 'ink-testing-library';
 import type { HistoryItem, HistoryItemToolGroup } from '../types.js';
 import { HistoryItemDisplay } from './HistoryItemDisplay.js';
-import { MainContent } from './MainContent.js';
+import { isFinal, MainContent } from './MainContent.js';
 import { MarkdownDisplay } from './MarkdownDisplay.js';
 import { ToolGroup } from './ToolGroup.js';
 
@@ -44,7 +44,7 @@ test('MarkdownDisplay uses Qwen block chrome and no separate streaming cursor', 
   assert.doesNotMatch(frame, /▍/);
 });
 
-test('ToolGroup uses a semantic compact row and tail-preserving full detail', () => {
+test('ToolGroup uses a semantic compact row and complete full detail', () => {
   const view = render(<ToolGroup item={toolGroup} terminalWidth={60} expanded={false} />);
   assert.match(view.lastFrame() ?? '', /✓ Read \/tmp\/example\.txt/);
   assert.doesNotMatch(view.lastFrame() ?? '', /tools|complete|[▸▾]/);
@@ -54,13 +54,14 @@ test('ToolGroup uses a semantic compact row and tail-preserving full detail', ()
     <ToolGroup item={toolGroup} terminalWidth={60} expanded maxOutputLines={2} />,
   );
   const expanded = view.lastFrame() ?? '';
-  assert.match(expanded, /read_file.*done.*12ms/);
+  assert.match(expanded, /ReadFile \/tmp\/example\.txt/);
+  assert.doesNotMatch(expanded, /\bdone\b|12ms/);
   assert.match(expanded, /input/);
-  assert.doesNotMatch(expanded, /first\n/);
-  assert.doesNotMatch(expanded, /second/);
+  assert.match(expanded, /first/);
+  assert.match(expanded, /second/);
   assert.match(expanded, /third/);
   assert.match(expanded, /fourth/);
-  assert.match(expanded, /first 2 lines hidden/);
+  assert.doesNotMatch(expanded, /lines hidden/);
 });
 
 test('a focused ToolGroup toggles from the keyboard', async () => {
@@ -124,6 +125,34 @@ test('MainContent renders committed history and a mutable pending tail', () => {
   assert.match(frame, /Reading files/);
   assert.match(frame, /◆︎ Reading files/);
   assert.doesNotMatch(frame, /▍/);
+});
+
+test('MainContent commits canceled tool groups but keeps confirming groups live', () => {
+  const canceled: HistoryItem = {
+    id: 'canceled-tools',
+    type: 'tool-group',
+    tools: [{
+      callId: 'canceled',
+      name: 'read',
+      arguments: { path: 'partial.ts' },
+      status: 'canceled',
+      updates: ['partial output'],
+    }],
+  };
+  const confirming: HistoryItem = {
+    id: 'confirming-tools',
+    type: 'tool-group',
+    tools: [{
+      callId: 'confirming',
+      name: 'write',
+      arguments: { path: 'approval.ts' },
+      status: 'confirming',
+      updates: [],
+    }],
+  };
+
+  assert.equal(isFinal(canceled), true);
+  assert.equal(isFinal(confirming), false);
 });
 
 test('MainContent renders a header as the first scrolling item in both modes', async () => {

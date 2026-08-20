@@ -273,6 +273,573 @@ test("merges live tool updates, ephemeral completion, and durable result", () =>
   assert.equal(group.tools[0].result?.durationMs, 8);
 });
 
+test("projects a real tool start without allowing a late start to downgrade completion", () => {
+  let projection = fromSnapshot(snapshot({
+    cursor: 1,
+    events: [{
+      id: "call-event",
+      seq: 1,
+      at: "2026-08-19T00:00:01.000Z",
+      type: "tool/call",
+      data: {
+        "call-id": "tool-1",
+        name: "bash",
+        arguments: { command: "sleep 1" },
+      },
+    }],
+  }));
+
+  projection = applyEnvelope(projection, {
+    type: "event",
+    hostSeq: 1,
+    event: "tool.execution/start",
+    data: {
+      "call-id": "tool-1",
+      name: "bash",
+      "execution-id": "execution-1",
+      "started-at": 1_777_000_000_123,
+    },
+  });
+  let group = projection.history[0];
+  assert.equal(group.type, "tool-group");
+  if (group.type !== "tool-group") return;
+  assert.equal(group.tools[0].status, "running");
+  assert.equal(group.tools[0].executionId, "execution-1");
+  assert.equal(group.tools[0].executionStartTime, 1_777_000_000_123);
+
+  for (let index = 0; index < 40; index += 1) {
+    projection = applyEnvelope(projection, {
+      type: "event",
+      hostSeq: 2 + index,
+      event: "tool.execution/update",
+      data: { "call-id": "tool-1", update: { index } },
+    });
+  }
+  projection = applyEnvelope(projection, {
+    type: "event",
+    hostSeq: 42,
+    event: "tool.execution/end",
+    data: { "call-id": "tool-1", name: "bash", ok: true, content: "done" },
+  });
+  projection = applyEnvelope(projection, {
+    type: "event",
+    hostSeq: 43,
+    event: "tool.execution/start",
+    data: {
+      "call-id": "tool-1",
+      name: "bash",
+      "execution-id": "late-execution",
+      "started-at": 1_777_000_000_999,
+    },
+  });
+  projection = applyEnvelope(projection, {
+    type: "event",
+    hostSeq: 44,
+    event: "tool.execution/update",
+    data: { "call-id": "tool-1", update: { index: 40 } },
+  });
+
+  group = projection.history[0];
+  assert.equal(group.type, "tool-group");
+  if (group.type !== "tool-group") return;
+  assert.equal(group.tools[0].status, "success");
+  assert.equal(group.tools[0].executionId, "execution-1");
+  assert.equal(group.tools[0].executionStartTime, 1_777_000_000_123);
+  assert.equal(group.tools[0].result?.content, "done");
+  assert.equal(group.tools[0].updates.length, 32);
+  assert.deepEqual(group.tools[0].updates[0], { index: 8 });
+  assert.deepEqual(group.tools[0].updates.at(-1), { index: 39 });
+});
+
+test("projects confirming and canceled as monotonic tool lifecycle states", () => {
+  let projection = fromSnapshot(snapshot({
+    cursor: 1,
+    events: [{
+      id: "call-event",
+      seq: 1,
+      at: "2026-08-19T00:00:01.000Z",
+      type: "tool/call",
+      data: { "call-id": "tool-1", name: "write", arguments: { path: "a.txt" } },
+    }],
+  }));
+
+  projection = applyEnvelope(projection, {
+    type: "event",
+    hostSeq: 1,
+    event: "tool.execution/confirming",
+    data: {
+      "call-id": "tool-1",
+      name: "write",
+      "execution-id": "execution-1",
+    },
+  });
+  let group = projection.history[0];
+  assert.equal(group.type, "tool-group");
+  if (group.type !== "tool-group") return;
+  assert.equal(group.tools[0].status, "confirming");
+
+  projection = applyEnvelope(projection, {
+    type: "event",
+    hostSeq: 2,
+    event: "tool.execution/end",
+    data: {
+      "call-id": "tool-1",
+      name: "write",
+      "execution-id": "execution-1",
+      status: "canceled",
+      cancelled: true,
+      ok: false,
+      error: "Agent run was cancelled",
+    },
+  });
+  projection = applyEnvelope(projection, {
+    type: "event",
+    hostSeq: 3,
+    event: "tool.execution/start",
+    data: {
+      "call-id": "tool-1",
+      "execution-id": "late-execution",
+      "started-at": 1_777_000_000_999,
+    },
+  });
+  projection = applyEnvelope(projection, {
+    type: "event",
+    hostSeq: 4,
+    event: "tool.execution/update",
+    data: { "call-id": "tool-1", update: "late update" },
+  });
+  projection = applyEnvelope(projection, {
+    type: "event",
+    hostSeq: 5,
+    event: "tool.execution/end",
+    data: { "call-id": "tool-1", status: "success", ok: true, content: "late success" },
+  });
+  projection = applyEnvelope(projection, {
+    type: "event",
+    durable: true,
+    hostSeq: 6,
+    event_id: "late-result",
+    seq: 2,
+    event: "tool/result",
+    data: { "call-id": "tool-1", status: "success", ok: true, content: "late durable" },
+  });
+
+  group = projection.history[0];
+  assert.equal(group.type, "tool-group");
+  if (group.type !== "tool-group") return;
+  assert.equal(group.tools[0].status, "canceled");
+  assert.equal(group.tools[0].executionId, "execution-1");
+  assert.equal(group.tools[0].executionStartTime, undefined);
+  assert.deepEqual(group.tools[0].updates, []);
+  assert.equal(group.tools[0].result?.cancelled, true);
+  assert.equal(group.tools[0].result?.error, "Agent run was cancelled");
+});
+
+test("agent abort terminalizes open tool calls from older event streams", () => {
+  const projection = fromSnapshot(snapshot({
+    cursor: 4,
+    events: [
+      {
+        id: "step-start",
+        seq: 1,
+        at: "2026-08-19T00:00:01.000Z",
+        type: "step/start",
+        data: { step: 1 },
+      },
+      {
+        id: "call-1",
+        seq: 2,
+        at: "2026-08-19T00:00:02.000Z",
+        type: "tool/call",
+        data: { "call-id": "pending", name: "read", arguments: {} },
+      },
+      {
+        id: "call-2",
+        seq: 3,
+        at: "2026-08-19T00:00:03.000Z",
+        type: "tool/call",
+        data: { "call-id": "running", name: "bash", arguments: {} },
+      },
+      {
+        id: "aborted",
+        seq: 4,
+        at: "2026-08-19T00:00:04.000Z",
+        type: "agent/aborted",
+        data: {},
+      },
+    ],
+  }));
+
+  const group = projection.history.find((item) => item.type === "tool-group");
+  assert.ok(group && group.type === "tool-group");
+  assert.deepEqual(group.tools.map((tool) => tool.status), ["canceled", "canceled"]);
+  assert.equal(projection.currentStep, null);
+  assert.equal(projection.toolBatchKey, null);
+});
+
+test("uses durable step boundaries to keep consecutive tool-loop batches separate", () => {
+  const projection = fromSnapshot(snapshot({
+    cursor: 10,
+    events: [
+      {
+        id: "step-1-start",
+        seq: 1,
+        at: "2026-08-19T00:00:01.000Z",
+        type: "step/start",
+        data: { step: 1 },
+      },
+      {
+        id: "call-1-event",
+        seq: 2,
+        at: "2026-08-19T00:00:02.000Z",
+        type: "tool/call",
+        data: { "call-id": "call-1", name: "read", arguments: { path: "a.ts" } },
+      },
+      {
+        id: "call-2-event",
+        seq: 3,
+        at: "2026-08-19T00:00:03.000Z",
+        type: "tool/call",
+        data: { "call-id": "call-2", name: "grep", arguments: { query: "todo" } },
+      },
+      {
+        id: "result-1-event",
+        seq: 4,
+        at: "2026-08-19T00:00:04.000Z",
+        type: "tool/result",
+        data: { "call-id": "call-1", name: "read", ok: true, content: "a" },
+      },
+      {
+        id: "result-2-event",
+        seq: 5,
+        at: "2026-08-19T00:00:05.000Z",
+        type: "tool/result",
+        data: { "call-id": "call-2", name: "grep", ok: true, content: "b" },
+      },
+      {
+        id: "step-1-end",
+        seq: 6,
+        at: "2026-08-19T00:00:06.000Z",
+        type: "step/end",
+        data: { step: 1, "tool-count": 2 },
+      },
+      {
+        id: "step-2-start",
+        seq: 7,
+        at: "2026-08-19T00:00:07.000Z",
+        type: "step/start",
+        data: { step: 2 },
+      },
+      {
+        id: "call-3-event",
+        seq: 8,
+        at: "2026-08-19T00:00:08.000Z",
+        type: "tool/call",
+        data: { "call-id": "call-3", name: "read", arguments: { path: "b.ts" } },
+      },
+      {
+        id: "result-3-event",
+        seq: 9,
+        at: "2026-08-19T00:00:09.000Z",
+        type: "tool/result",
+        data: { "call-id": "call-3", name: "read", ok: true, content: "c" },
+      },
+      {
+        id: "step-2-end",
+        seq: 10,
+        at: "2026-08-19T00:00:10.000Z",
+        type: "step/end",
+        data: { step: 2, "tool-count": 1 },
+      },
+    ],
+  }));
+
+  const groups = projection.history.filter((item) => item.type === "tool-group");
+  assert.equal(groups.length, 2);
+  assert.deepEqual(groups.map((group) => group.tools.map((tool) => tool.callId)), [
+    ["call-1", "call-2"],
+    ["call-3"],
+  ]);
+  assert.deepEqual(groups.map((group) => group.batchKey), ["step-1-start", "step-2-start"]);
+  assert.equal(projection.currentStep, null);
+  assert.equal(projection.toolBatchKey, null);
+});
+
+test("scopes a reused call id to its step for live lifecycle and durable result", () => {
+  let projection = fromSnapshot(snapshot({
+    cursor: 7,
+    events: [
+      {
+        id: "step-1-start",
+        seq: 1,
+        at: "2026-08-19T00:00:01.000Z",
+        type: "step/start",
+        data: { step: 1 },
+      },
+      {
+        id: "step-1-call",
+        seq: 2,
+        at: "2026-08-19T00:00:02.000Z",
+        type: "tool/call",
+        data: {
+          "call-id": "reused-call",
+          name: "read",
+          arguments: { path: "first.ts" },
+        },
+      },
+      {
+        id: "step-1-result",
+        seq: 3,
+        at: "2026-08-19T00:00:03.000Z",
+        type: "tool/result",
+        data: {
+          "call-id": "reused-call",
+          name: "read",
+          "execution-id": "execution-step-1",
+          ok: true,
+          content: "first result",
+        },
+      },
+      {
+        id: "step-1-end",
+        seq: 4,
+        at: "2026-08-19T00:00:04.000Z",
+        type: "step/end",
+        data: { step: 1, "tool-count": 1 },
+      },
+      {
+        id: "step-2-start",
+        seq: 5,
+        at: "2026-08-19T00:00:05.000Z",
+        type: "step/start",
+        data: { step: 2 },
+      },
+      {
+        id: "step-2-call",
+        seq: 6,
+        at: "2026-08-19T00:00:06.000Z",
+        type: "tool/call",
+        data: {
+          "call-id": "reused-call",
+          name: "read",
+          arguments: { path: "second.ts" },
+        },
+      },
+    ],
+  }));
+
+  let groups = projection.history.filter((item) => item.type === "tool-group");
+  assert.equal(groups.length, 2);
+  assert.deepEqual(groups.map((group) => group.batchKey), ["step-1-start", "step-2-start"]);
+  assert.deepEqual(groups.map((group) => group.tools[0].arguments), [
+    { path: "first.ts" },
+    { path: "second.ts" },
+  ]);
+
+  projection = apply(
+    projection,
+    {
+      type: "event",
+      hostSeq: 20,
+      event: "tool.execution/start",
+      data: {
+        "call-id": "reused-call",
+        "execution-id": "execution-step-2",
+        "started-at": 1_777_000_000_200,
+      },
+    },
+    {
+      type: "event",
+      hostSeq: 21,
+      event: "tool.execution/update",
+      data: {
+        "call-id": "reused-call",
+        "execution-id": "execution-step-2",
+        update: "second update",
+      },
+    },
+    {
+      type: "event",
+      hostSeq: 22,
+      event: "tool.execution/end",
+      data: {
+        "call-id": "reused-call",
+        "execution-id": "execution-step-2",
+        ok: true,
+        content: "live second result",
+      },
+    },
+    {
+      type: "event",
+      hostSeq: 23,
+      durable: true,
+      event_id: "step-2-result",
+      seq: 7,
+      event: "tool/result",
+      data: {
+        "call-id": "reused-call",
+        "execution-id": "execution-step-2",
+        ok: true,
+        content: "durable second result",
+        "duration-ms": 9,
+      },
+    },
+  );
+
+  groups = projection.history.filter((item) => item.type === "tool-group");
+  assert.equal(groups[0].tools[0].executionId, "execution-step-1");
+  assert.equal(groups[0].tools[0].result?.content, "first result");
+  assert.deepEqual(groups[0].tools[0].updates, []);
+  assert.equal(groups[1].tools[0].executionId, "execution-step-2");
+  assert.equal(groups[1].tools[0].executionStartTime, 1_777_000_000_200);
+  assert.deepEqual(groups[1].tools[0].updates, ["second update"]);
+  assert.equal(groups[1].tools[0].result?.content, "durable second result");
+  assert.equal(groups[1].tools[0].result?.durationMs, 9);
+});
+
+test("uses run scope when durable tool events have no step boundaries", () => {
+  const projection = fromSnapshot(snapshot({
+    cursor: 4,
+    events: [
+      {
+        id: "run-1-call",
+        seq: 1,
+        at: "2026-08-19T00:00:01.000Z",
+        type: "tool/call",
+        run_id: "run-1",
+        data: { "call-id": "same-call", name: "read", arguments: { path: "one" } },
+      },
+      {
+        id: "run-1-result",
+        seq: 2,
+        at: "2026-08-19T00:00:02.000Z",
+        type: "tool/result",
+        run_id: "run-1",
+        data: { "call-id": "same-call", ok: true, content: "one" },
+      },
+      {
+        id: "run-2-call",
+        seq: 3,
+        at: "2026-08-19T00:00:03.000Z",
+        type: "tool/call",
+        run_id: "run-2",
+        data: { "call-id": "same-call", name: "read", arguments: { path: "two" } },
+      },
+      {
+        id: "run-2-result",
+        seq: 4,
+        at: "2026-08-19T00:00:04.000Z",
+        type: "tool/result",
+        run_id: "run-2",
+        data: { "call-id": "same-call", ok: false, error: "two failed" },
+      },
+    ],
+  }));
+
+  const groups = projection.history.filter((item) => item.type === "tool-group");
+  assert.equal(groups.length, 2);
+  assert.deepEqual(groups.map((group) => group.runId), ["run-1", "run-2"]);
+  assert.deepEqual(groups.map((group) => group.tools[0].arguments), [
+    { path: "one" },
+    { path: "two" },
+  ]);
+  assert.equal(groups[0].tools[0].status, "success");
+  assert.equal(groups[0].tools[0].result?.content, "one");
+  assert.equal(groups[1].tools[0].status, "error");
+  assert.equal(groups[1].tools[0].result?.error, "two failed");
+});
+
+test("keeps unscoped legacy tool replay independent of the current agent run", () => {
+  const projection = fromSnapshot(snapshot({
+    cursor: 2,
+    state: { phase: "tool", "run-id": "currently-running" },
+    events: [
+      {
+        id: "legacy-call",
+        seq: 1,
+        at: "2026-08-19T00:00:01.000Z",
+        type: "tool/call",
+        data: { "call-id": "legacy", name: "read", arguments: { path: "old" } },
+      },
+      {
+        id: "legacy-result",
+        seq: 2,
+        at: "2026-08-19T00:00:02.000Z",
+        type: "tool/result",
+        data: { "call-id": "legacy", ok: true, content: "old result" },
+      },
+    ],
+  }));
+
+  const group = projection.history.find((item) => item.type === "tool-group");
+  assert.ok(group && group.type === "tool-group");
+  assert.equal(group.runId, undefined);
+  assert.equal(group.tools.length, 1);
+  assert.equal(group.tools[0].status, "success");
+  assert.equal(group.tools[0].result?.content, "old result");
+});
+
+test("starts a new legacy tool instance when a terminal call id is reused after a message", () => {
+  const projection = fromSnapshot(snapshot({
+    cursor: 6,
+    events: [
+      {
+        id: "user-1",
+        seq: 1,
+        at: "2026-08-19T00:00:01.000Z",
+        type: "message",
+        data: { message: { role: "user", content: "Read the first file" } },
+      },
+      {
+        id: "legacy-call-1",
+        seq: 2,
+        at: "2026-08-19T00:00:02.000Z",
+        type: "tool/call",
+        data: { "call-id": "same", name: "read", arguments: { path: "one.ts" } },
+      },
+      {
+        id: "legacy-result-1",
+        seq: 3,
+        at: "2026-08-19T00:00:03.000Z",
+        type: "tool/result",
+        data: { "call-id": "same", ok: true, content: "first" },
+      },
+      {
+        id: "user-2",
+        seq: 4,
+        at: "2026-08-19T00:00:04.000Z",
+        type: "message",
+        data: { message: { role: "user", content: "Now read the second file" } },
+      },
+      {
+        id: "legacy-call-2",
+        seq: 5,
+        at: "2026-08-19T00:00:05.000Z",
+        type: "tool/call",
+        data: { "call-id": "same", name: "read", arguments: { path: "two.ts" } },
+      },
+      {
+        id: "legacy-result-2",
+        seq: 6,
+        at: "2026-08-19T00:00:06.000Z",
+        type: "tool/result",
+        data: { "call-id": "same", ok: false, error: "second failed" },
+      },
+    ],
+  }));
+
+  const groups = projection.history.filter((item) => item.type === "tool-group");
+  assert.equal(groups.length, 2);
+  assert.deepEqual(groups.map((group) => group.tools[0].arguments), [
+    { path: "one.ts" },
+    { path: "two.ts" },
+  ]);
+  assert.equal(groups[0].tools[0].status, "success");
+  assert.equal(groups[0].tools[0].result?.content, "first");
+  assert.equal(groups[1].tools[0].status, "error");
+  assert.equal(groups[1].tools[0].result?.error, "second failed");
+});
+
 test("projects agent state, queue, interactions, and run errors without duplicates", () => {
   let projection = fromSnapshot(snapshot({
     interactions: [{

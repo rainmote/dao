@@ -21,10 +21,14 @@ interface MainContentProps {
   onToolGroupExpandedChange?: (id: string, expanded: boolean) => void;
 }
 
-function isFinal(item: HistoryItem): boolean {
+export function isFinal(item: HistoryItem): boolean {
   if (item.type === 'assistant') return item.streaming !== true;
   if (item.type === 'tool-group') {
-    return item.tools.every((tool) => tool.status === 'success' || tool.status === 'error');
+    return item.tools.every(
+      (tool) => tool.status === 'success'
+        || tool.status === 'error'
+        || tool.status === 'canceled',
+    );
   }
   return true;
 }

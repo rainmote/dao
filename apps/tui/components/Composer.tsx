@@ -143,7 +143,7 @@ function normalizedDescription(description: string): string {
 
 /**
  * A backend-agnostic, controlled Ink composer. It follows Qwen Code's
- * input/steer/follow-up model while keeping protocol choices in its parent.
+ * input/steer/queue model while keeping protocol choices in its parent.
  */
 export function Composer({
   value,
@@ -292,10 +292,17 @@ export function Composer({
         return;
       }
 
+      // Qwen Code reserves Ctrl+Q for a message that should wait until the
+      // active turn reaches its idle boundary. Keep this before the generic
+      // control-key guard so the control character can never enter the input.
+      if (key.ctrl && input.toLocaleLowerCase() === 'q') {
+        if (busy) submit(true);
+        return;
+      }
+
       if (key.return) {
         if (key.meta) {
-          if (busy) submit(true);
-          else commit(insertNewline(current), true);
+          commit(insertNewline(current), true);
           return;
         }
         if (key.ctrl || key.shift) {

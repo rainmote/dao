@@ -44,14 +44,23 @@
               (let [approve (kernel/service ctx :approval/request)
                     approval-request
                     {:tool tool-name
+                     :name tool-name
+                     :call-id (get-in request [:execution :call-id])
+                     :cancel-token (get-in request [:execution :cancel-token])
                      :arguments (get-in request [:execution :arguments])
                      :target (get-in request [:execution :approval])
                      :execution-token (get-in request [:execution :token])}
+                    _ (kernel/emit!
+                       ctx :tool.execution/confirming
+                       {:execution-id (:execution-token approval-request)
+                        :call-id (:call-id approval-request)
+                        :name tool-name})
                     decision (if approve
                                (approve approval-request)
                                :deny)]
                 (record-decision!
-                 ctx (assoc approval-request :decision decision))
+                 ctx (assoc (dissoc approval-request :cancel-token)
+                            :decision decision))
                 (if (= :allow decision)
                   (next request)
                   (deny request "Tool execution was not approved."

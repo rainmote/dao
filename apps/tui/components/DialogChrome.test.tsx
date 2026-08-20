@@ -140,7 +140,7 @@ test("header and footer expose Qwen-style runtime context without duplication", 
   assert.match(header.lastFrame() ?? "", /___ ___/);
   assert.match(header.lastFrame() ?? "", /openai-compatible \| qwen-coder/);
   assert.match(header.lastFrame() ?? "", /Tips: Type \/ to see all available commands/);
-  assert.match(footer.lastFrame() ?? "", /Alt\+Enter follow-up/);
+  assert.match(footer.lastFrame() ?? "", /Enter to steer · Ctrl\+Q to queue/);
   assert.match(footer.lastFrame() ?? "", /20\.0% used/);
   assert.match(footer.lastFrame() ?? "", /2 queued/);
   assert.doesNotMatch(footer.lastFrame() ?? "", /\/workspace\/dao/);

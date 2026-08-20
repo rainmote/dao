@@ -74,6 +74,22 @@
    :details details
    :content (str "ERROR: " message)})
 
+(defn- cancelled-error? [error]
+  (true? (:cancelled (ex-data error))))
+
+(defn- cancelled-result [execution]
+  {:ok false
+   :is-error true
+   :cancelled true
+   :execution execution
+   :error "Agent run was cancelled"
+   :details {:cancelled true}
+   :content "Tool execution was cancelled."})
+
+(defn- cancelled-result? [result]
+  (or (true? (:cancelled result))
+      (true? (get-in result [:details :cancelled]))))
+
 (defn- run-tool-body [{:keys [tool execution]}]
   (try
     (cancellation/throw-if-cancelled! (:cancel-token execution))
@@ -92,29 +108,38 @@
                   (render (:arguments execution) value)
                   (result-content value))})
     (catch Throwable error
-      (failure execution (ex-message error) (ex-data error)))))
+      (if (cancelled-error? error)
+        (cancelled-result execution)
+        (failure execution (ex-message error) (ex-data error))))))
+
+(defn- record-tool-call! [ctx tool-call]
+  (let [visible-arguments (try
+                            (arguments tool-call)
+                            (catch Throwable _
+                              (get-in tool-call [:function :arguments])))]
+    (record! ctx "tool/call"
+             {:name (get-in tool-call [:function :name])
+              :call-id (:id tool-call)
+              :arguments visible-arguments})))
 
 (defn- prepare-call! [ctx tool-call cancel-token on-update]
-  (cancellation/throw-if-cancelled! cancel-token)
   (let [call-id (:id tool-call)
         tool-name (get-in tool-call [:function :name])
         tool (kernel/tool ctx tool-name)
-        visible-arguments (try
-                            (arguments tool-call)
-                            (catch Throwable _
-                              (get-in tool-call [:function :arguments])))
         base-execution {:token (str (random-uuid))
                         :call-id call-id
                         :name tool-name
-                        :started-at-nanos (System/nanoTime)
                         :cancel-token cancel-token
                         :on-update on-update}]
-    (record! ctx "tool/call" {:name tool-name
-                               :call-id call-id
-                               :arguments visible-arguments})
-    (if-not tool
+    (cond
+      (cancellation/cancelled? cancel-token)
+      {:call tool-call :result (cancelled-result base-execution)}
+
+      (nil? tool)
       {:call tool-call
        :result (failure base-execution (str "Unknown tool: " tool-name))}
+
+      :else
       (try
         (let [args (arguments tool-call)
               execution (cond-> (assoc base-execution :arguments args)
@@ -122,61 +147,128 @@
                           (assoc :approval
                                  ((:approval-target tool) args)))
               validation-errors (schema/errors (:parameters tool) args)]
-          (if (seq validation-errors)
+          (cond
+            (cancellation/cancelled? cancel-token)
+            {:call tool-call :result (cancelled-result execution)}
+
+            (seq validation-errors)
             {:call tool-call
              :result (failure execution "Invalid tool arguments"
                               {:errors validation-errors})}
+
+            :else
             (let [gate (kernel/waterfall
                         ctx :tool/pre-execute
                         {:decision :pending
                          :execution execution
                          :tool tool}
                         #(assoc % :decision :allow))]
-              (if (= :deny (:decision gate))
+              (cond
+                (cancellation/cancelled? cancel-token)
+                {:call tool-call
+                 :result (cancelled-result (:execution gate))}
+
+                (= :deny (:decision gate))
                 {:call tool-call
                  :result (assoc (failure execution
                                          (or (:reason gate)
                                              "Denied by policy"))
                                 :terminate (boolean (:terminate gate)))}
+
+                :else
                 {:call tool-call
                  :prepared {:execution (:execution gate)
                             :tool (:tool gate)}}))))
         (catch Throwable error
           {:call tool-call
-           :result (failure base-execution (ex-message error)
-                            (ex-data error))})))))
+           :result (if (or (cancelled-error? error)
+                           (cancellation/cancelled? cancel-token))
+                     (cancelled-result base-execution)
+                     (failure base-execution (ex-message error)
+                              (ex-data error)))})))))
 
-(defn- execute-prepared! [ctx {:keys [prepared result] :as entry}]
+(defn- execute-prepared! [ctx {:keys [prepared result] :as entry} begin!]
   (if result
     entry
-    (try
-      (assoc entry :result
-             (kernel/waterfall
-              ctx :tool/post-execute
-              (kernel/waterfall ctx :tool/execute prepared run-tool-body)
-              identity))
-      (catch Throwable error
-        (assoc entry :result
-               (failure (:execution prepared) (ex-message error)
-                        (ex-data error)))))))
+    (let [base-execution (:execution prepared)]
+      (if (cancellation/cancelled? (:cancel-token base-execution))
+        (assoc entry :result (cancelled-result base-execution))
+        (let [started-at (System/currentTimeMillis)
+              execution (assoc base-execution
+                               :started-at-nanos (System/nanoTime)
+                               :started-at started-at)
+              prepared (assoc prepared :execution execution)]
+          ;; The slot serializes start against cancellation. If cancellation
+          ;; already won, no start can appear after the terminal event.
+          (if-not (begin! execution)
+            (assoc entry :result (cancelled-result execution))
+            (try
+              (let [outcome (kernel/waterfall
+                             ctx :tool/post-execute
+                             (kernel/waterfall ctx :tool/execute prepared
+                                               run-tool-body)
+                             identity)
+                    outcome (cond
+                              (cancelled-result? outcome)
+                              (cancelled-result
+                               (or (:execution outcome) execution))
 
-(defn- record-tool-result! [ctx {:keys [call result]}]
-  (let [started-at (get-in result [:execution :started-at-nanos])
-        duration-ms (when started-at
-                      (max 0 (quot (- (System/nanoTime) started-at) 1000000)))
-        result-data {:name (get-in call [:function :name])
-                     :call-id (:id call)
-                     :ok (:ok result)
-                     :is-error (:is-error result)
-                     :error (:error result)
-                     :value (:value result)
-                     :details (:details result)
-                     :content (:content result)
-                     :duration-ms duration-ms}]
+                              (cancellation/cancelled?
+                               (:cancel-token execution))
+                              (cancelled-result
+                               (or (:execution outcome) execution))
+
+                              :else outcome)]
+                (assoc entry :result outcome))
+              (catch Throwable error
+                (assoc entry :result
+                       (if (or (cancelled-error? error)
+                               (cancellation/cancelled?
+                                (:cancel-token execution)))
+                         (cancelled-result execution)
+                         (failure execution (ex-message error)
+                                  (ex-data error))))))))))))
+
+(defn- result-status [{:keys [ok is-error details] :as result}]
+  (let [exit-code (or (:exit-code details) (:exit_code details)
+                      (:exitCode details))]
+    (cond
+      (cancelled-result? result) :canceled
+      (or (false? ok) is-error
+          (and (number? exit-code) (not (zero? exit-code)))) :error
+      :else :success)))
+
+(defn- tool-result-data [{:keys [call result]}]
+  (let [execution (:execution result)
+        started-at-nanos (:started-at-nanos execution)
+        duration-ms (when (and started-at-nanos (:started-at execution))
+                      (max 0 (quot (- (System/nanoTime) started-at-nanos)
+                                   1000000)))
+        status (result-status result)]
+    {:name (get-in call [:function :name])
+     :call-id (:id call)
+     :execution-id (:token execution)
+     :started-at (:started-at execution)
+     :status status
+     :cancelled (= :canceled status)
+     :ok (:ok result)
+     :is-error (:is-error result)
+     :error (:error result)
+     :value (:value result)
+     :details (:details result)
+     :content (:content result)
+     :duration-ms duration-ms}))
+
+(defn- emit-tool-end! [ctx entry]
+  (let [result-data (tool-result-data entry)]
     (kernel/emit! ctx :tool.execution/end result-data)
+    (assoc entry :result-data result-data)))
+
+(defn- record-tool-result! [ctx {:keys [call result result-data] :as entry}]
+  (let [entry (if result-data entry (emit-tool-end! ctx entry))
+        result-data (:result-data entry)]
     ;; Canonical values can be large and often duplicate model content. Persist
-    ;; the compact, renderer-oriented details instead so restored TUI cards keep
-    ;; their semantics without doubling session size.
+    ;; compact renderer data in model order, independently of live completion.
     (record! ctx "tool/result" (dissoc result-data :value))
     [call result]))
 
@@ -184,7 +276,8 @@
   (mapv (fn [tool-call]
           {:call tool-call
            :result
-           (failure {:call-id (:id tool-call)
+           (failure {:token (str (random-uuid))
+                     :call-id (:id tool-call)
                      :name (get-in tool-call [:function :name])}
                     (str "Tool call was not executed because the model response "
                          "hit its output-token limit."))})
@@ -195,6 +288,64 @@
    (some #(= :sequential (get-in % [:prepared :tool :execution-mode]))
          prepared)))
 
+(defn- completion-slot [entry]
+  {:entry entry
+   :transition-lock (Object.)
+   :terminal? (atom false)
+   :execution (atom (or (get-in entry [:prepared :execution])
+                        (get-in entry [:result :execution])))
+   :completion (promise)})
+
+(defn- begin-slot! [ctx {:keys [transition-lock terminal? execution]} started]
+  (locking transition-lock
+    (when-not @terminal?
+      (reset! execution started)
+      (kernel/emit! ctx :tool.execution/start
+                    {:execution-id (:token started)
+                     :call-id (:call-id started)
+                     :name (:name started)
+                     :started-at (:started-at started)})
+      true)))
+
+(defn- complete-slot!
+  [ctx {:keys [transition-lock terminal? completion]} entry]
+  (locking transition-lock
+    (when-not @terminal?
+      (reset! terminal? true)
+      ;; Preflight failures are emitted as soon as they are known, before a
+      ;; later approval can block the batch. Reuse that exact terminal payload
+      ;; when the ordered completion slots are assembled afterwards.
+      (deliver completion (if (:result-data entry)
+                            entry
+                            (emit-tool-end! ctx entry)))))
+  nil)
+
+(defn- cancel-slot!
+  [ctx {:keys [entry execution transition-lock] :as slot}]
+  (locking transition-lock
+    (when-let [execution @execution]
+      (complete-slot! ctx slot
+                      (assoc entry :result
+                             (cancelled-result execution))))))
+
+(defn- execute-slots-sequentially! [ctx slots cancel-token]
+  (doseq [{:keys [entry terminal?] :as slot} slots]
+    (when-not @terminal?
+      (if (cancellation/cancelled? cancel-token)
+        (cancel-slot! ctx slot)
+        (complete-slot! ctx slot
+                        (execute-prepared!
+                         ctx entry #(begin-slot! ctx slot %)))))))
+
+(defn- execute-slots-in-parallel! [ctx slots tasks]
+  (doseq [{:keys [entry terminal?] :as slot} slots
+          :when (and (:prepared entry) (not @terminal?))]
+    (swap! tasks conj
+           (future
+             (complete-slot! ctx slot
+                             (execute-prepared!
+                              ctx entry #(begin-slot! ctx slot %)))))))
+
 (defn- execute-batch! [ctx tool-calls cancel-token]
   (let [update! (fn [execution update]
                   (kernel/emit! ctx :tool.execution/update
@@ -202,19 +353,43 @@
                                  :call-id (:call-id execution)
                                  :name (:name execution)
                                  :update update}))
-        ;; Policy and approval always run in model order before any body starts.
-        prepared (mapv #(prepare-call! ctx % cancel-token update!) tool-calls)
-        executed (if (sequential-batch? prepared)
-                   (mapv #(do
-                            (cancellation/throw-if-cancelled! cancel-token)
-                            (execute-prepared! ctx %))
-                         prepared)
-                   (let [tasks (mapv #(future (execute-prepared! ctx %))
-                                     prepared)]
-                     (mapv deref tasks)))]
-    ;; Durable results are ordered by the original model calls even when live
-    ;; updates and bodies completed in another order.
-    (mapv #(record-tool-result! ctx %) executed)))
+        _ (doseq [tool-call tool-calls]
+            (record-tool-call! ctx tool-call))
+        ;; Policy and approval remain serial and all finish before a body starts.
+        ;; A terminal preflight outcome is nevertheless visible immediately;
+        ;; durable results are still drained in model order below.
+        prepared (mapv (fn [tool-call]
+                         (let [entry (prepare-call! ctx tool-call cancel-token
+                                                    update!)]
+                           (if (:result entry)
+                             (emit-tool-end! ctx entry)
+                             entry)))
+                       tool-calls)
+        slots (mapv completion-slot prepared)
+        tasks (atom [])]
+    ;; Invalid, unknown, denied, and already-cancelled calls are terminal before
+    ;; execution. Complete them before installing the cancellation callback.
+    (doseq [{:keys [entry] :as slot} slots
+            :when (:result entry)]
+      (complete-slot! ctx slot entry))
+    (let [dispose-cancel
+          (cancellation/on-cancel!
+           cancel-token
+           (fn []
+             (doseq [slot slots]
+               (cancel-slot! ctx slot))))]
+      (try
+        (if (sequential-batch? prepared)
+          (execute-slots-sequentially! ctx slots cancel-token)
+          (execute-slots-in-parallel! ctx slots tasks))
+        (let [executed (mapv #(deref (:completion %)) slots)]
+          (when (cancellation/cancelled? cancel-token)
+            (doseq [task @tasks]
+              (future-cancel task)))
+          ;; Only this ordered drain mutates the durable session.
+          (mapv #(record-tool-result! ctx %) executed))
+        (finally
+          (dispose-cancel))))))
 
 (defn- tool-result-message [tool-call result]
   {:role "tool"
@@ -398,6 +573,11 @@
         (swap! active assoc :accepting-queue? false))
       continue-count)))
 
+(defn- close-aborted-step! [ctx listeners step]
+  (let [turn-end {:step step :tool-count 0 :aborted true}]
+    (record! ctx "step/end" turn-end)
+    (publish! ctx listeners :agent.turn/end turn-end)))
+
 (defn- run-agent-body!
   [ctx config active admission-lock prompt options cancel-token queue state
    listeners]
@@ -420,26 +600,50 @@
                      :tools (kernel/tool-schemas ctx)
                      :cancel-token cancel-token
                      :options (:model-options options)}
-            response (generate-with-recovery!
-                      ctx config request cancel-token state listeners)
+            response (try
+                       (generate-with-recovery!
+                        ctx config request cancel-token state listeners)
+                       (catch Throwable error
+                         ;; Some providers report an ordinary HTTP/transport
+                         ;; error after their request has already been aborted.
+                         ;; The user cancellation is authoritative and must
+                         ;; close the open step as an abort, not an agent error.
+                         (if (cancellation/cancelled? cancel-token)
+                           (do
+                             (close-aborted-step! ctx listeners step)
+                             (cancellation/throw-if-cancelled! cancel-token))
+                           (throw error))))
             assistant (assoc (:message response) :role "assistant")
             tool-calls (vec (:tool_calls assistant))
             next-usage (add-usage usage (:usage response))]
+        ;; A provider may ignore cooperative cancellation and return a normal
+        ;; response later. Close the already-open step, but do not commit that
+        ;; stale assistant answer or any stale tool calls into the durable
+        ;; conversation.
+        (when (cancellation/cancelled? cancel-token)
+          (close-aborted-step! ctx listeners step)
+          (cancellation/throw-if-cancelled! cancel-token))
         (record-message! ctx assistant)
         (publish! ctx listeners :agent.message/end {:message assistant})
         (if (seq tool-calls)
           (let [executions (if (= "length" (:finish-reason response))
-                             (mapv #(record-tool-result! ctx %)
-                                   (truncated-tool-results tool-calls))
+                             (do
+                               (doseq [tool-call tool-calls]
+                                 (record-tool-call! ctx tool-call))
+                               (mapv #(record-tool-result! ctx %)
+                                     (truncated-tool-results tool-calls)))
                              (do
                                (set-phase! ctx state listeners :tool)
                                (execute-batch! ctx tool-calls cancel-token)))
-                results (mapv second executions)]
+                results (mapv second executions)
+                turn-end (cond-> {:step step :tool-count (count results)}
+                           (cancellation/cancelled? cancel-token)
+                           (assoc :aborted true))]
             (doseq [[call result] executions]
               (record-message! ctx (tool-result-message call result)))
-            (record! ctx "step/end" {:step step :tool-count (count results)})
-            (publish! ctx listeners :agent.turn/end
-                      {:step step :tool-count (count results)})
+            (record! ctx "step/end" turn-end)
+            (publish! ctx listeners :agent.turn/end turn-end)
+            (cancellation/throw-if-cancelled! cancel-token)
             (if (and (seq results) (every? :terminate results))
               (do
                 (close-admission! ctx active admission-lock queue listeners
@@ -449,10 +653,13 @@
                  :messages (messages ctx)})
               (recur (inc step) next-usage)))
           (let [continue-count (finish-or-continue!
-                                ctx active admission-lock queue listeners)]
-            (record! ctx "step/end" {:step step :tool-count 0})
-            (publish! ctx listeners :agent.turn/end
-                      {:step step :tool-count 0})
+                                ctx active admission-lock queue listeners)
+                turn-end (cond-> {:step step :tool-count 0}
+                           (cancellation/cancelled? cancel-token)
+                           (assoc :aborted true))]
+            (record! ctx "step/end" turn-end)
+            (publish! ctx listeners :agent.turn/end turn-end)
+            (cancellation/throw-if-cancelled! cancel-token)
             (if (pos? continue-count)
               (recur (inc step) next-usage)
               {:content (or (:content assistant) "")

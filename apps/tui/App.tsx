@@ -865,13 +865,20 @@ export function App({
   const queueRows = queueCount > 0
     ? 2 + Math.min(3, queueCount) + (queueCount > 3 ? 1 : 0)
     : 0;
+  const waitingForConfirmation = dialog?.type === 'approval';
+  const confirmationRows = waitingForConfirmation ? 1 : 0;
+  const loadingRows = busy
+    ? width <= 30 || width >= 80
+      ? 1
+      : 2
+    : 0;
   const statusRows = operationError || inlineNotice ? 1 : 0;
   const dialogHeight = dialog
     ? Math.max(6, Math.min(height - 4, Math.floor(height * 0.55)))
     : 0;
   const controlsHeight = dialog
-    ? dialogHeight + statusRows
-    : 5 + (busy ? 1 : 0) + queueRows + aboveExtensionRows +
+    ? dialogHeight + confirmationRows + statusRows
+    : 5 + loadingRows + queueRows + aboveExtensionRows +
       belowExtensionRows + statusRows;
   const contentHeight = Math.max(
     3,
@@ -935,18 +942,27 @@ export function App({
       )}
 
       {projection && dialog ? (
-        <Box
-          width={width}
-          height={dialogHeight}
-          flexDirection="column"
-          overflow="hidden"
-        >
-          <DialogManager
-            dialog={dialog}
-            terminalHeight={dialogHeight}
-            terminalWidth={width}
-          />
-        </Box>
+        <>
+          {waitingForConfirmation && (
+            <LoadingIndicator
+              busy={busy}
+              mode="waiting-for-confirmation"
+              terminalWidth={width}
+            />
+          )}
+          <Box
+            width={width}
+            height={dialogHeight}
+            flexDirection="column"
+            overflow="hidden"
+          >
+            <DialogManager
+              dialog={dialog}
+              terminalHeight={dialogHeight}
+              terminalWidth={width}
+            />
+          </Box>
+        </>
       ) : projection ? (
         <>
           {hasAboveExtensions && (

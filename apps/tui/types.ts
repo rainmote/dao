@@ -90,10 +90,17 @@ export interface Envelope {
   error?: { message?: string; data?: unknown };
 }
 
-export type ToolCallStatus = "pending" | "running" | "success" | "error";
+export type ToolCallStatus =
+  | "pending"
+  | "confirming"
+  | "running"
+  | "success"
+  | "error"
+  | "canceled";
 
 export interface ToolResult {
   ok?: boolean;
+  cancelled?: boolean;
   content?: string;
   error?: string;
   details?: unknown;
@@ -107,6 +114,7 @@ export interface ToolCall {
   status: ToolCallStatus;
   updates: unknown[];
   executionId?: string;
+  executionStartTime?: number;
   result?: ToolResult;
 }
 
@@ -130,6 +138,8 @@ export interface HistoryItemAssistant extends HistoryItemBase {
 export interface HistoryItemToolGroup extends HistoryItemBase {
   type: "tool-group";
   tools: ToolCall[];
+  batchKey?: string;
+  runId?: string;
 }
 
 export interface HistoryItemInfo extends HistoryItemBase {
@@ -153,6 +163,9 @@ export interface UiProjection {
   sessionId: string;
   cursor: number;
   history: HistoryItem[];
+  currentStep: number | null;
+  toolBatchKey: string | null;
+  toolRunId: string | null;
   state: AgentState;
   queue: QueueItem[];
   interactions: Interaction[];

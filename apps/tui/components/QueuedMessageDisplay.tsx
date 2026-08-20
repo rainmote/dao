@@ -46,7 +46,7 @@ export function QueuedMessageDisplay({ items }: QueuedMessageDisplayProps) {
       {showHint && (
         <Box paddingLeft={2}>
           <Text color={qwenTheme.text.secondary} italic>
-            Alt+Enter to queue a follow-up
+            Ctrl+Q to queue
           </Text>
         </Box>
       )}

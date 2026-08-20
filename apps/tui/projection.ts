@@ -24,6 +24,8 @@ const EMPTY_UI_EXTENSIONS: UiExtensions = {
   shortcuts: {},
 };
 
+const MAX_TOOL_UPDATES = 32;
+
 function valueAt(source: JsonObject | undefined, ...keys: string[]): unknown {
   for (const key of keys) {
     if (source && source[key] !== undefined) return source[key];
@@ -219,6 +221,16 @@ function addMessage(
 
 function toolStatus(data: JsonObject, completed: boolean): ToolCallStatus {
   if (!completed) return "pending";
+  const explicit = textAt(data, "status")?.toLowerCase();
+  if (
+    explicit === "canceled" ||
+    explicit === "cancelled" ||
+    data.cancelled === true ||
+    data.canceled === true
+  ) {
+    return "canceled";
+  }
+  if (explicit === "success" || explicit === "error") return explicit;
   const details = objectValue(data.details);
   const exitCode = numberAt(details, "exit-code", "exit_code", "exitCode");
   return data.ok === false || data["is-error"] === true || data.is_error === true ||
@@ -227,38 +239,122 @@ function toolStatus(data: JsonObject, completed: boolean): ToolCallStatus {
     : "success";
 }
 
-function findTool(history: HistoryItem[], callId: string): ToolCall | undefined {
-  for (const item of history) {
-    if (item.type !== "tool-group") continue;
-    const tool = item.tools.find((entry) => entry.callId === callId);
-    if (tool) return tool;
-  }
-  return undefined;
+function terminalToolStatus(status: ToolCallStatus): boolean {
+  return status === "success" || status === "error" || status === "canceled";
 }
 
-function updateTool(
+interface ToolScope {
+  batchKey: string | null;
+  runId: string | null;
+  executionId?: string;
+}
+
+interface ToolLocation {
+  groupIndex: number;
+  toolIndex: number;
+  tool: ToolCall;
+}
+
+function toolRunId(
+  projection: UiProjection,
+  data: JsonObject,
+  eventRunId?: string,
+): string | null {
+  return eventRunId ||
+    textAt(data, "run-id", "run_id", "runId") ||
+    projection.toolRunId;
+}
+
+function toolScope(
+  projection: UiProjection,
+  data: JsonObject,
+  eventRunId?: string,
+): ToolScope {
+  return {
+    batchKey:
+      textAt(data, "batch-key", "batch_key", "batchKey") ||
+      projection.toolBatchKey,
+    runId: toolRunId(projection, data, eventRunId),
+    executionId: textAt(data, "execution-id", "execution_id", "executionId"),
+  };
+}
+
+function findTool(
   history: HistoryItem[],
   callId: string,
+  scope: ToolScope,
+): ToolLocation | undefined {
+  const locations: ToolLocation[] = [];
+  for (let groupIndex = history.length - 1; groupIndex >= 0; groupIndex -= 1) {
+    const item = history[groupIndex];
+    if (item.type !== "tool-group") continue;
+    for (let toolIndex = item.tools.length - 1; toolIndex >= 0; toolIndex -= 1) {
+      const tool = item.tools[toolIndex];
+      if (tool.callId === callId) locations.push({ groupIndex, toolIndex, tool });
+    }
+  }
+
+  if (scope.executionId) {
+    const executionMatch = locations.find(
+      ({ tool }) => tool.executionId === scope.executionId,
+    );
+    if (executionMatch) return executionMatch;
+  }
+  if (scope.batchKey) {
+    const batchMatch = locations.find(({ groupIndex }) => {
+      const item = history[groupIndex];
+      return item.type === "tool-group" && item.batchKey === scope.batchKey;
+    });
+    return batchMatch;
+  }
+  if (scope.runId) {
+    const runMatch = locations.find(({ groupIndex }) => {
+      const item = history[groupIndex];
+      return item.type === "tool-group" && item.runId === scope.runId;
+    });
+    if (runMatch) return runMatch;
+  }
+  // Older sessions have neither step/batch nor run metadata. Preserve their
+  // replay behavior while preferring the most recent occurrence if an ID was
+  // reused, rather than mutating every historical occurrence.
+  return !scope.batchKey && !scope.runId ? locations[0] : undefined;
+}
+
+function updateToolAt(
+  history: HistoryItem[],
+  location: ToolLocation,
   update: (tool: ToolCall) => ToolCall,
 ): HistoryItem[] {
-  return history.map((item) =>
-    item.type === "tool-group" && item.tools.some((tool) => tool.callId === callId)
-      ? { ...item, tools: item.tools.map((tool) => (tool.callId === callId ? update(tool) : tool)) }
-      : item,
-  );
+  return history.map((item, groupIndex) => {
+    if (groupIndex !== location.groupIndex || item.type !== "tool-group") return item;
+    return {
+      ...item,
+      tools: item.tools.map((tool, toolIndex) =>
+        toolIndex === location.toolIndex ? update(tool) : tool
+      ),
+    };
+  });
 }
 
 function addToolCall(
   projection: UiProjection,
-  event: Pick<DurableEvent, "id" | "at" | "data">,
+  event: Pick<DurableEvent, "id" | "at" | "data" | "run_id">,
 ): UiProjection {
   const callId = textAt(event.data, "call-id", "call_id", "callId");
   if (!callId) return projection;
-  const existing = findTool(projection.history, callId);
-  if (existing) {
+  const scope = toolScope(projection, event.data, event.run_id);
+  const existing = findTool(projection.history, callId, scope);
+  const newLegacyOccurrence = Boolean(
+    existing &&
+      !scope.batchKey &&
+      !scope.runId &&
+      (terminalToolStatus(existing.tool.status) ||
+        existing.groupIndex !== projection.history.length - 1),
+  );
+  if (existing && !newLegacyOccurrence) {
     return {
       ...projection,
-      history: updateTool(projection.history, callId, (tool) => ({
+      history: updateToolAt(projection.history, existing, (tool) => ({
         ...tool,
         name: textAt(event.data, "name") || tool.name,
         arguments: valueAt(event.data, "arguments", "args") ?? tool.arguments,
@@ -273,7 +369,16 @@ function addToolCall(
     updates: [],
   };
   const last = projection.history.at(-1);
-  if (last?.type === "tool-group") {
+  const sameBatch = scope.batchKey
+    ? last?.type === "tool-group" && last.batchKey === scope.batchKey
+    : scope.runId
+      ? last?.type === "tool-group" &&
+        last.batchKey === undefined &&
+        last.runId === scope.runId
+      : last?.type === "tool-group" &&
+        last.batchKey === undefined &&
+        last.runId === undefined;
+  if (!newLegacyOccurrence && sameBatch && last?.type === "tool-group") {
     const group: HistoryItemToolGroup = { ...last, tools: [...last.tools, tool] };
     return { ...projection, history: [...projection.history.slice(0, -1), group] };
   }
@@ -281,41 +386,139 @@ function addToolCall(
     ...projection,
     history: [
       ...projection.history,
-      { id: `tool-group:${event.id}`, type: "tool-group", tools: [tool], timestamp: event.at },
+      {
+        id: `tool-group:${event.id}`,
+        type: "tool-group",
+        tools: [tool],
+        batchKey: scope.batchKey || undefined,
+        runId: scope.runId || undefined,
+        timestamp: event.at,
+      },
     ],
   };
 }
 
-function ensureTool(projection: UiProjection, data: JsonObject, id: string, at?: string): UiProjection {
+function ensureTool(
+  projection: UiProjection,
+  data: JsonObject,
+  id: string,
+  at?: string,
+  eventRunId?: string,
+): { projection: UiProjection; location: ToolLocation | undefined } {
   const callId = textAt(data, "call-id", "call_id", "callId");
-  if (!callId || findTool(projection.history, callId)) return projection;
-  return addToolCall(projection, { id, at: at || new Date(0).toISOString(), data });
+  if (!callId) return { projection, location: undefined };
+  const scope = toolScope(projection, data, eventRunId);
+  const existing = findTool(projection.history, callId, scope);
+  if (existing) return { projection, location: existing };
+  const withTool = addToolCall(projection, {
+    id,
+    at: at || new Date(0).toISOString(),
+    data,
+    run_id: eventRunId,
+  });
+  return { projection: withTool, location: findTool(withTool.history, callId, scope) };
 }
 
-function applyToolUpdate(projection: UiProjection, data: JsonObject, envelopeId: string): UiProjection {
+function applyToolUpdate(
+  projection: UiProjection,
+  data: JsonObject,
+  envelopeId: string,
+  eventRunId?: string,
+): UiProjection {
   const callId = textAt(data, "call-id", "call_id", "callId");
   if (!callId) return projection;
-  const withTool = ensureTool(projection, data, envelopeId);
+  const ensured = ensureTool(projection, data, envelopeId, undefined, eventRunId);
+  if (!ensured.location) return ensured.projection;
   const update = valueAt(data, "update");
   return {
-    ...withTool,
-    history: updateTool(withTool.history, callId, (tool) => ({
-      ...tool,
-      name: textAt(data, "name") || tool.name,
-      executionId:
-        textAt(data, "execution-id", "execution_id", "executionId") || tool.executionId,
-      status: "running",
-      updates: update === undefined ? tool.updates : [...tool.updates, update],
-    })),
+    ...ensured.projection,
+    history: updateToolAt(ensured.projection.history, ensured.location, (tool) =>
+      terminalToolStatus(tool.status)
+        ? tool
+        : {
+            ...tool,
+            name: textAt(data, "name") || tool.name,
+            executionId:
+              tool.executionId || textAt(data, "execution-id", "execution_id", "executionId"),
+            status: "running",
+            updates:
+              update === undefined
+                ? tool.updates
+                : [...tool.updates, update].slice(-MAX_TOOL_UPDATES),
+          },
+    ),
   };
 }
 
-function applyToolResult(projection: UiProjection, data: JsonObject, envelopeId: string): UiProjection {
+function applyToolConfirming(
+  projection: UiProjection,
+  data: JsonObject,
+  envelopeId: string,
+  eventRunId?: string,
+): UiProjection {
   const callId = textAt(data, "call-id", "call_id", "callId");
   if (!callId) return projection;
-  const withTool = ensureTool(projection, data, envelopeId);
+  const ensured = ensureTool(projection, data, envelopeId, undefined, eventRunId);
+  if (!ensured.location) return ensured.projection;
+  return {
+    ...ensured.projection,
+    history: updateToolAt(ensured.projection.history, ensured.location, (tool) =>
+      terminalToolStatus(tool.status)
+        ? tool
+        : {
+            ...tool,
+            name: textAt(data, "name") || tool.name,
+            executionId:
+              tool.executionId || textAt(data, "execution-id", "execution_id", "executionId"),
+            status: tool.status === "pending" ? "confirming" : tool.status,
+          },
+    ),
+  };
+}
+
+function applyToolStart(
+  projection: UiProjection,
+  data: JsonObject,
+  envelopeId: string,
+  eventRunId?: string,
+): UiProjection {
+  const callId = textAt(data, "call-id", "call_id", "callId");
+  if (!callId) return projection;
+  const ensured = ensureTool(projection, data, envelopeId, undefined, eventRunId);
+  if (!ensured.location) return ensured.projection;
+  const executionStartTime = numberAt(data, "started-at", "started_at", "startedAt");
+  return {
+    ...ensured.projection,
+    history: updateToolAt(ensured.projection.history, ensured.location, (tool) =>
+      terminalToolStatus(tool.status)
+        ? tool
+        : {
+            ...tool,
+            name: textAt(data, "name") || tool.name,
+            executionId:
+              tool.executionId || textAt(data, "execution-id", "execution_id", "executionId"),
+            executionStartTime: tool.executionStartTime ?? executionStartTime,
+            status: "running",
+          },
+    ),
+  };
+}
+
+function applyToolResult(
+  projection: UiProjection,
+  data: JsonObject,
+  envelopeId: string,
+  authoritative = false,
+  eventRunId?: string,
+): UiProjection {
+  const callId = textAt(data, "call-id", "call_id", "callId");
+  if (!callId) return projection;
+  const ensured = ensureTool(projection, data, envelopeId, undefined, eventRunId);
+  if (!ensured.location) return ensured.projection;
   const result: ToolResult = {};
   if (typeof data.ok === "boolean") result.ok = data.ok;
+  if (typeof data.cancelled === "boolean") result.cancelled = data.cancelled;
+  else if (typeof data.canceled === "boolean") result.cancelled = data.canceled;
   const content = textAt(data, "content");
   const error = textAt(data, "error");
   const durationMs = numberAt(data, "duration-ms", "duration_ms", "durationMs");
@@ -324,14 +527,54 @@ function applyToolResult(projection: UiProjection, data: JsonObject, envelopeId:
   if (data.details !== undefined) result.details = data.details;
   if (durationMs !== undefined) result.durationMs = durationMs;
   return {
-    ...withTool,
-    history: updateTool(withTool.history, callId, (tool) => ({
-      ...tool,
-      name: textAt(data, "name") || tool.name,
-      status: toolStatus(data, true),
-      result,
-    })),
+    ...ensured.projection,
+    history: updateToolAt(ensured.projection.history, ensured.location, (tool) => {
+      const incomingStatus = toolStatus(data, true);
+      const preserveTerminal = !authoritative && terminalToolStatus(tool.status);
+      const preserveCancellation =
+        tool.status === "canceled" && incomingStatus !== "canceled";
+      const preserve = preserveTerminal || preserveCancellation;
+      if (preserve) return tool;
+      const next: ToolCall = {
+        ...tool,
+        name: textAt(data, "name") || tool.name,
+        status: incomingStatus,
+        result,
+      };
+      if (!next.executionId) {
+        const executionId = textAt(data, "execution-id", "execution_id", "executionId");
+        if (executionId) next.executionId = executionId;
+      }
+      if (next.executionStartTime === undefined) {
+        const executionStartTime = numberAt(data, "started-at", "started_at", "startedAt");
+        if (executionStartTime !== undefined) next.executionStartTime = executionStartTime;
+      }
+      return next;
+    }),
   };
+}
+
+function cancelOpenTools(history: HistoryItem[]): HistoryItem[] {
+  return history.map((item) =>
+    item.type === "tool-group"
+      ? {
+          ...item,
+          tools: item.tools.map((tool) =>
+            terminalToolStatus(tool.status)
+              ? tool
+              : {
+                  ...tool,
+                  status: "canceled" as const,
+                  result: tool.result || {
+                    ok: false,
+                    cancelled: true,
+                    error: "Agent run was cancelled",
+                  },
+                },
+          ),
+        }
+      : item,
+  );
 }
 
 function addError(projection: UiProjection, id: string, text: string, timestamp?: string): UiProjection {
@@ -392,12 +635,26 @@ function addNotification(
 
 function applyDurableEvent(projection: UiProjection, event: DurableEvent): UiProjection {
   switch (event.type) {
+    case "step/start":
+      return {
+        ...projection,
+        currentStep: numberAt(event.data, "step") ?? null,
+        toolBatchKey: event.id,
+        toolRunId: toolRunId(projection, event.data, event.run_id),
+      };
+    case "step/end":
+      return {
+        ...projection,
+        currentStep: null,
+        toolBatchKey: null,
+        toolRunId: null,
+      };
     case "message":
       return addMessage(projection, event);
     case "tool/call":
       return addToolCall(projection, event);
     case "tool/result":
-      return applyToolResult(projection, event.data, event.id);
+      return applyToolResult(projection, event.data, event.id, true, event.run_id);
     case "agent/error":
       return addError(
         projection,
@@ -408,13 +665,22 @@ function applyDurableEvent(projection: UiProjection, event: DurableEvent): UiPro
     case "agent/aborted":
       return {
         ...projection,
+        currentStep: null,
+        toolBatchKey: null,
+        toolRunId: null,
         history: [
-          ...projection.history,
+          ...cancelOpenTools(projection.history),
           { id: event.id, type: "info", text: "Agent run aborted", timestamp: event.at },
         ],
       };
     case "session/clear":
-      return { ...projection, history: [] };
+      return {
+        ...projection,
+        history: [],
+        currentStep: null,
+        toolBatchKey: null,
+        toolRunId: null,
+      };
     case "session/compaction": {
       const replacements = valueAt(event.data, "replacement_messages", "replacement-messages");
       if (!Array.isArray(replacements)) return projection;
@@ -425,7 +691,13 @@ function applyDurableEvent(projection: UiProjection, event: DurableEvent): UiPro
             at: event.at,
             data: { message },
           }),
-        { ...projection, history: [] },
+        {
+          ...projection,
+          history: [],
+          currentStep: null,
+          toolBatchKey: null,
+          toolRunId: null,
+        },
       );
     }
     default:
@@ -450,6 +722,9 @@ export function fromSnapshot(snapshot: Snapshot): UiProjection {
     sessionId: snapshot.session_id,
     cursor: snapshot.cursor,
     history: [],
+    currentStep: null,
+    toolBatchKey: null,
+    toolRunId: null,
     state: normalizeAgentState(snapshot.state),
     queue: normalizeQueue(valueAt(snapshot.state, "queue")),
     interactions: normalizeInteractions(snapshot.interactions || []),
@@ -520,11 +795,28 @@ export function applyEnvelope(projection: UiProjection, envelope: Envelope): UiP
       }
       break;
     }
+    case "tool.execution/start":
+      next = applyToolStart(
+        projection,
+        data,
+        hostKey || `live:${textAt(data, "call-id", "call_id", "callId") || "tool"}:start`,
+        envelope.run_id,
+      );
+      break;
+    case "tool.execution/confirming":
+      next = applyToolConfirming(
+        projection,
+        data,
+        hostKey || `live:${textAt(data, "call-id", "call_id", "callId") || "tool"}:confirming`,
+        envelope.run_id,
+      );
+      break;
     case "tool.execution/update":
       next = applyToolUpdate(
         projection,
         data,
         hostKey || `live:${textAt(data, "call-id", "call_id", "callId") || "tool"}`,
+        envelope.run_id,
       );
       break;
     case "tool.execution/end":
@@ -532,6 +824,8 @@ export function applyEnvelope(projection: UiProjection, envelope: Envelope): UiP
         projection,
         data,
         hostKey || `live:${textAt(data, "call-id", "call_id", "callId") || "tool"}`,
+        false,
+        envelope.run_id,
       );
       break;
     case "queue/changed":

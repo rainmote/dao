@@ -41,6 +41,25 @@ function snapshot(
   };
 }
 
+function durableEvent(
+  hostSeq: number,
+  eventId: string,
+  seq: number,
+  event: string,
+  data: Record<string, unknown>,
+): PluginEvent {
+  return {
+    type: 'event',
+    hostSeq,
+    durable: true,
+    event_id: eventId,
+    seq,
+    event,
+    at: `2026-08-19T00:00:${String(seq).padStart(2, '0')}.000Z`,
+    data,
+  };
+}
+
 class FakeTransport implements AppTransport {
   readonly calls: Array<{ method: string; params: Record<string, unknown> }> = [];
   snapshotValue: Snapshot;
@@ -133,7 +152,124 @@ test('loads snapshot and commands, then projects live events', async () => {
   view.unmount();
 });
 
-test('routes idle submit, busy steer/follow-up, abort, and quit', async () => {
+test('renders one Qwen tool summary per durable step and changes its tense on completion', async () => {
+  const transport = new FakeTransport();
+  const view = render(<App transport={transport} cwd="/workspace/dao" />);
+  await flush();
+  const startedAt = Date.now();
+
+  transport.emit(durableEvent(10, 'step-1-start', 2, 'step/start', { step: 1 }));
+  transport.emit(durableEvent(11, 'read-call', 3, 'tool/call', {
+    'call-id': 'read-1',
+    name: 'read',
+    arguments: { path: 'README.md' },
+  }));
+  transport.emit(durableEvent(12, 'grep-call', 4, 'tool/call', {
+    'call-id': 'grep-1',
+    name: 'grep',
+    arguments: { pattern: 'ToolGroup' },
+  }));
+  transport.emit(durableEvent(13, 'ls-call', 5, 'tool/call', {
+    'call-id': 'ls-1',
+    name: 'ls',
+    arguments: { path: 'apps/tui/components' },
+  }));
+  for (const [index, callId, name] of [
+    [0, 'read-1', 'read'],
+    [1, 'grep-1', 'grep'],
+    [2, 'ls-1', 'ls'],
+  ] as const) {
+    transport.emit({
+      type: 'event',
+      hostSeq: 14 + index,
+      event: 'tool.execution/start',
+      data: {
+        'call-id': callId,
+        name,
+        'execution-id': `execution-${callId}`,
+        'started-at': startedAt + index,
+      },
+    });
+  }
+  await flush();
+
+  const runningFrame = view.lastFrame() ?? '';
+  assert.match(
+    runningFrame,
+    /Searching ToolGroup, reading README\.md, listing apps\/tui\/components…/,
+  );
+  assert.doesNotMatch(
+    runningFrame,
+    /Searched ToolGroup, read README\.md, listed apps\/tui\/components/,
+  );
+  assert.equal(
+    runningFrame.split('\n').filter((line) => line.includes('ToolGroup')).length,
+    1,
+  );
+
+  transport.emit(durableEvent(17, 'read-result', 6, 'tool/result', {
+    'call-id': 'read-1',
+    name: 'read',
+    ok: true,
+    content: 'read output',
+  }));
+  transport.emit(durableEvent(18, 'grep-result', 7, 'tool/result', {
+    'call-id': 'grep-1',
+    name: 'grep',
+    ok: true,
+    content: 'grep output',
+  }));
+  transport.emit(durableEvent(19, 'ls-result', 8, 'tool/result', {
+    'call-id': 'ls-1',
+    name: 'ls',
+    ok: true,
+    content: 'ls output',
+  }));
+  transport.emit(durableEvent(20, 'step-1-end', 9, 'step/end', {
+    step: 1,
+    'tool-count': 3,
+  }));
+  await flush();
+
+  const completedFrame = view.lastFrame() ?? '';
+  assert.match(
+    completedFrame,
+    /✓ Searched ToolGroup, read README\.md, listed apps\/tui\/components/,
+  );
+  assert.doesNotMatch(completedFrame, /Searching ToolGroup/);
+
+  transport.emit(durableEvent(21, 'step-2-start', 10, 'step/start', { step: 2 }));
+  transport.emit(durableEvent(22, 'second-read-call', 11, 'tool/call', {
+    'call-id': 'read-2',
+    name: 'read',
+    arguments: { path: 'second-step.ts' },
+  }));
+  transport.emit(durableEvent(23, 'second-read-result', 12, 'tool/result', {
+    'call-id': 'read-2',
+    name: 'read',
+    ok: true,
+    content: 'second output',
+  }));
+  transport.emit(durableEvent(24, 'step-2-end', 13, 'step/end', {
+    step: 2,
+    'tool-count': 1,
+  }));
+  await flush();
+
+  const separateStepsFrame = view.lastFrame() ?? '';
+  assert.match(
+    separateStepsFrame,
+    /✓ Searched ToolGroup, read README\.md, listed apps\/tui\/components/,
+  );
+  assert.match(separateStepsFrame, /✓ Read second-step\.ts/);
+  assert.doesNotMatch(
+    separateStepsFrame,
+    /read README\.md, second-step\.ts|read second-step\.ts, README\.md/,
+  );
+  view.unmount();
+});
+
+test('routes idle submit, busy steer/Ctrl+Q queue, abort, and quit', async () => {
   const transport = new FakeTransport();
   let exits = 0;
   const view = render(
@@ -161,7 +297,7 @@ test('routes idle submit, busy steer/follow-up, abort, and quit', async () => {
   await flush();
   view.stdin.write('afterwards');
   await flush();
-  view.stdin.write('\u001b\r');
+  view.stdin.write('\u0011');
   await flush();
   assert.ok(transport.calls.some(
     (entry) => entry.method === 'turn.steer' && entry.params.message === 'steer now',
@@ -318,8 +454,19 @@ test('resolves approval and generic confirm prompts through separate methods', a
   assert.match(approvalFrame, /bb-agent/);
   assert.match(approvalFrame, /existing message/);
   assert.match(approvalFrame, /Run command/);
+  assert.match(
+    approvalFrame,
+    /⠏ Waiting for user confirmation\.\.\./,
+  );
+  assert.ok(
+    approvalFrame.indexOf('Waiting for user confirmation...') <
+      approvalFrame.indexOf('Run command'),
+  );
+  assert.doesNotMatch(approvalFrame, /\(\d+s · esc to cancel\)/);
   assert.doesNotMatch(approvalFrame, /Type your message/);
   assert.doesNotMatch(approvalFrame, /\? for shortcuts/);
+  assert.match(approvalFrame, /Enter to confirm, ↑↓ to navigate, Esc to deny/);
+  assert.ok(approvalFrame.split('\n').length <= 24);
   view.stdin.write('\r');
   await flush();
   assert.ok(transport.calls.some(
@@ -342,7 +489,9 @@ test('resolves approval and generic confirm prompts through separate methods', a
   const confirmTransport = new FakeTransport(snapshot('idle', [confirm]));
   const confirmView = render(<App transport={confirmTransport} />);
   await flush();
-  assert.match(confirmView.lastFrame() ?? '', /Continue/);
+  const confirmFrame = confirmView.lastFrame() ?? '';
+  assert.match(confirmFrame, /Continue/);
+  assert.doesNotMatch(confirmFrame, /Waiting for user confirmation/);
   confirmView.stdin.write('\u001b[A');
   await flush();
   confirmView.stdin.write('\r');
@@ -369,6 +518,7 @@ test('resolves input prompts as strings and does not cancel required input', asy
   await flush();
   assert.match(view.lastFrame() ?? '', /Your name/);
   assert.match(view.lastFrame() ?? '', /Ada/);
+  assert.doesNotMatch(view.lastFrame() ?? '', /Waiting for user confirmation/);
 
   view.stdin.write('\u001b');
   await flush();
@@ -401,6 +551,7 @@ test('keeps a custom prompt open until its JSON parses', async () => {
   const transport = new FakeTransport(snapshot('idle', [customPrompt]));
   const view = render(<App transport={transport} />);
   await flush();
+  assert.doesNotMatch(view.lastFrame() ?? '', /Waiting for user confirmation/);
 
   view.stdin.write('{');
   await flush();
@@ -438,6 +589,7 @@ test('supports scalar prompt options and optional cancellation', async () => {
   await flush();
   assert.match(view.lastFrame() ?? '', /quick/);
   assert.match(view.lastFrame() ?? '', /Deep mode/);
+  assert.doesNotMatch(view.lastFrame() ?? '', /Waiting for user confirmation/);
   view.stdin.write('\r');
   await flush();
   assert.ok(transport.calls.some(
