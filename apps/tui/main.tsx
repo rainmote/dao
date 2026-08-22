@@ -1,7 +1,11 @@
 import { render, type Instance } from 'ink';
 
 import { App } from './App.js';
-import { openTerminal, type TerminalStreams } from './terminal.js';
+import {
+  allowOwnedResizeListeners,
+  openTerminal,
+  type TerminalStreams,
+} from './terminal.js';
 import { PluginTransport } from './transport.js';
 
 async function run(): Promise<void> {
@@ -15,6 +19,7 @@ async function run(): Promise<void> {
   });
   let terminal: TerminalStreams | undefined;
   let view: Instance | undefined;
+  let restoreOutputListenerLimit: (() => void) | undefined;
 
   const unmount = () => {
     view?.unmount();
@@ -22,6 +27,7 @@ async function run(): Promise<void> {
 
   try {
     terminal = openTerminal();
+    restoreOutputListenerLimit = allowOwnedResizeListeners(terminal.output);
     view = render(
       <App transport={transport} onExit={unmount} />,
       {
@@ -44,6 +50,7 @@ async function run(): Promise<void> {
     process.off('SIGHUP', unmount);
     view?.unmount();
     view?.cleanup();
+    restoreOutputListenerLimit?.();
     transport.close();
     terminal?.close();
   }

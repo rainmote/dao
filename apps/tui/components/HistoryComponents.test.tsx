@@ -56,7 +56,8 @@ test('ToolGroup uses a semantic compact row and complete full detail', () => {
   const expanded = view.lastFrame() ?? '';
   assert.match(expanded, /ReadFile \/tmp\/example\.txt/);
   assert.doesNotMatch(expanded, /\bdone\b|12ms/);
-  assert.match(expanded, /input/);
+  assert.doesNotMatch(expanded, /^\s*(?:input|output|error|update)\s*$/m);
+  assert.doesNotMatch(expanded, /"path":/);
   assert.match(expanded, /first/);
   assert.match(expanded, /second/);
   assert.match(expanded, /third/);

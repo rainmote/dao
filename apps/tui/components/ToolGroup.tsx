@@ -402,8 +402,20 @@ function toolOutput(tool: ToolCall): string {
   if (tool.result?.error) return valueText(tool.result.error);
   if (tool.result?.content) return valueText(tool.result.content);
   if (tool.result?.details !== undefined) return valueText(tool.result.details);
-  if (tool.updates.length > 0) return valueText(tool.updates.at(-1));
+  if (tool.updates.length > 0) return updateText(tool.updates.at(-1));
   return '';
+}
+
+function updateText(update: unknown): string {
+  if (!update || typeof update !== 'object' || Array.isArray(update)) {
+    return valueText(update);
+  }
+  const data = update as Record<string, unknown>;
+  for (const key of ['chunk', 'stdout', 'stderr', 'output', 'content', 'text', 'message']) {
+    const value = data[key];
+    if (typeof value === 'string') return valueText(value);
+  }
+  return valueText(update);
 }
 
 function isWide(codePoint: number): boolean {
@@ -574,7 +586,6 @@ function ToolLine({
     || !isCollapsible
     || tool.status === 'error'
     || tool.status === 'canceled';
-  const showInput = expanded || tool.status === 'error';
   return (
     <Box flexDirection="column">
       <Box>
@@ -593,19 +604,8 @@ function ToolLine({
         </Box>
         <ToolElapsedTime tool={tool} status={tool.status} />
       </Box>
-      {showInput && (
-        <Box flexDirection="column" marginLeft={2}>
-          <Text dimColor color={qwenTheme.text.secondary}>input</Text>
-          <Text color={qwenTheme.text.primary} wrap="wrap">{valueText(tool.arguments) || '{}'}</Text>
-        </Box>
-      )}
       {showOutput && output.text && (
         <Box flexDirection="column" marginLeft={2}>
-          {showInput && (
-            <Text dimColor color={qwenTheme.text.secondary}>
-              {tool.status === 'error' ? 'error' : tool.result ? 'output' : 'update'}
-            </Text>
-          )}
           {output.omitted > 0 && (
             <Text dimColor color={qwenTheme.text.secondary}>{`... first ${output.omitted} lines hidden ...`}</Text>
           )}

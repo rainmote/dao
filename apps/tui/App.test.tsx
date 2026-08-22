@@ -269,6 +269,67 @@ test('renders one Qwen tool summary per durable step and changes its tense on co
   view.unmount();
 });
 
+test('renders live and completed action output with the same Qwen tool layout', async () => {
+  const transport = new FakeTransport();
+  const view = render(<App transport={transport} cwd="/workspace/dao" />);
+  await flush();
+
+  transport.emit(durableEvent(10, 'step-1-start', 2, 'step/start', { step: 1 }));
+  transport.emit(durableEvent(11, 'shell-call', 3, 'tool/call', {
+    'call-id': 'shell-1',
+    name: 'bash',
+    arguments: { command: 'npm test' },
+  }));
+  transport.emit({
+    type: 'event',
+    hostSeq: 12,
+    event: 'tool.execution/start',
+    data: {
+      'call-id': 'shell-1',
+      name: 'bash',
+      'execution-id': 'execution-shell-1',
+      'started-at': Date.now(),
+    },
+  });
+  transport.emit({
+    type: 'event',
+    hostSeq: 13,
+    event: 'tool.execution/update',
+    data: {
+      'call-id': 'shell-1',
+      name: 'bash',
+      'execution-id': 'execution-shell-1',
+      update: { stream: 'stdout', chunk: 'live output' },
+    },
+  });
+  await flush();
+
+  const liveFrame = view.lastFrame() ?? '';
+  assert.match(liveFrame, /Shell npm test/);
+  assert.match(liveFrame, /live output/);
+  assert.doesNotMatch(liveFrame, /"stream"|"chunk"|stdout:/);
+  assert.doesNotMatch(liveFrame, /^\s*(?:input|output|error|update)\s*$/m);
+
+  transport.emit(durableEvent(14, 'shell-result', 4, 'tool/result', {
+    'call-id': 'shell-1',
+    name: 'bash',
+    ok: true,
+    content: 'final output',
+  }));
+  transport.emit(durableEvent(15, 'step-1-end', 5, 'step/end', {
+    step: 1,
+    'tool-count': 1,
+  }));
+  await flush();
+
+  const completedFrame = view.lastFrame() ?? '';
+  assert.match(completedFrame, /✓ Shell npm test/);
+  assert.match(completedFrame, /final output/);
+  assert.doesNotMatch(completedFrame, /live output/);
+  assert.doesNotMatch(completedFrame, /^\s*(?:input|output|error|update)\s*$/m);
+  view.unmount();
+});
+
 test('routes idle submit, busy steer/Ctrl+Q queue, abort, and quit', async () => {
   const transport = new FakeTransport();
   let exits = 0;

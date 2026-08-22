@@ -38,12 +38,22 @@
                       :size]))
 
 (defn- render-read-result
-  [_ {:keys [content offset line-count total-lines truncated truncated-by
-             first-line-exceeds-limit max-chars]}]
-  (let [start-line (inc offset)
-        end-line (+ offset line-count)
+  [{requested-offset :offset}
+   {result-offset :offset
+    :keys [content line-count total-lines truncated truncated-by
+           first-line-exceeds-limit max-chars]}]
+  (let [requested-offset (or requested-offset 1)
+        start-line (inc result-offset)
+        end-line (+ result-offset line-count)
+        beyond-eof? (or (and (zero? total-lines) (> requested-offset 1))
+                        (and (pos? total-lines)
+                             (> requested-offset total-lines)))
         notice
         (cond
+          beyond-eof?
+          (str "[Offset " requested-offset " is beyond end of file ("
+               total-lines " lines total); no lines returned.]")
+
           (zero? total-lines)
           "[Read empty file (0 lines).]"
 
@@ -75,6 +85,7 @@
    :description (str "Read UTF-8 file lines. offset is a one-based line "
                      "number and limit is the maximum number of lines. "
                      "Continue with the offset reported by a truncated result. "
+                     "Offsets beyond EOF return no lines. "
                      "Discovered skills and their assets use skill:// URLs.")
    :parameters {:type "object"
                 :required ["path"]
@@ -89,32 +100,22 @@
                        (target-path world (:path %) false))
    :execute
    (fn [{:keys [offset] :as args} _]
-     (let [requested-offset (or offset 1)
-           request (assoc args
-                          :offset (dec requested-offset)
+     (let [request (assoc args
+                          :offset (dec (or offset 1))
                           :unit :lines
                           :limit (or (:limit args) default-lines)
-                          :max-chars max-chars)
-           result (if (skill-url? (:path args))
-                    ((:read-skill-resource (skill-resources ctx)) request)
-                    ((:read! world) request))]
-       (when (and (pos? requested-offset)
-                  (or (and (zero? (:total-lines result)) (> requested-offset 1))
-                      (and (pos? (:total-lines result))
-                           (> requested-offset (:total-lines result)))))
-         (throw (ex-info
-                 (str "Offset " requested-offset " is beyond end of file ("
-                      (:total-lines result) " lines total)")
-                 {:offset requested-offset
-                  :total-lines (:total-lines result)})))
-       result))
+                          :max-chars max-chars)]
+       (if (skill-url? (:path args))
+         ((:read-skill-resource (skill-resources ctx)) request)
+         ((:read! world) request))))
    :result-details (fn [_ value] (read-details value))
    :render render-read-result})
 
 (defn- read-file-alias [ctx world default-lines max-chars]
   (assoc (read-tool ctx world default-lines max-chars)
          :name "read_file"
-         :description "Compatibility alias for read."))
+         :description (str "Compatibility alias for read. "
+                           "Offsets beyond EOF return no lines.")))
 
 (defn- write-tool [world]
   {:name "write"

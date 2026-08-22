@@ -298,6 +298,23 @@ test('shows bounded action results and the latest live update while keeping read
   view.unmount();
 });
 
+test('renders streamed tool chunks as Qwen output instead of transport JSON', () => {
+  const shell = tool('shell', 'bash', { command: 'npm test' }, 'running');
+  shell.updates = [
+    { stream: 'stdout', chunk: 'first line\nsecond line' },
+  ];
+
+  const view = render(
+    <ToolGroup item={group([shell])} terminalWidth={80} />,
+  );
+  const frame = view.lastFrame() ?? '';
+
+  assert.match(frame, /Shell npm test/);
+  assert.match(frame, /first line\n\s+second line/);
+  assert.doesNotMatch(frame, /"stream"|"chunk"|stdout:/);
+  view.unmount();
+});
+
 test('keeps canceled read tools individual and surfaces their partial output', () => {
   const completed = tool('done', 'read', { path: 'done.ts' });
   completed.result = { content: 'DONE-READ-RESULT-HIDDEN' };
@@ -317,7 +334,7 @@ test('keeps canceled read tools individual and surfaces their partial output', (
   view.unmount();
 });
 
-test('an errored tool shows its input and error reason without full-detail mode', () => {
+test('an errored tool shows its reason directly below the Qwen tool row', () => {
   const completed = tool('completed', 'read', { path: 'context.ts' });
   completed.result = { content: 'context output' };
   const failed = tool('failed', 'read', { path: 'broken.ts' }, 'error');
@@ -332,14 +349,16 @@ test('an errored tool shows its input and error reason without full-detail mode'
   assert.doesNotMatch(frame, /context output/);
   assert.match(frame, /x ReadFile broken\.ts/);
   assert.doesNotMatch(frame, /· (?:done|failed)/);
-  assert.match(frame, /input/);
-  assert.match(frame, /"path": "broken\.ts"/);
-  assert.match(frame, /error/);
   assert.match(frame, /permission denied/);
+  assert.doesNotMatch(frame, /^\s*(?:input|output|error|update)\s*$/m);
+  const lines = frame.split('\n');
+  const header = lines.findIndex((line) => line.includes('broken.ts'));
+  const reason = lines.findIndex((line) => line.includes('permission denied'));
+  assert.equal(reason, header + 1);
   view.unmount();
 });
 
-test('expanded mode renders complete tool input and output without truncation', () => {
+test('expanded mode renders every tool and complete output without extra field labels', () => {
   const first = tool('a', 'read', { path: 'a.ts' });
   first.result = { content: 'first\nsecond\nthird' };
   const second = tool('b', 'grep', { pattern: 'needle' });
@@ -363,5 +382,7 @@ test('expanded mode renders complete tool input and output without truncation', 
   assert.match(frame, /third/);
   assert.match(frame, /hit/);
   assert.doesNotMatch(frame, /\bRead a\.ts|Searched needle/);
+  assert.doesNotMatch(frame, /^\s*(?:input|output|error|update)\s*$/m);
+  assert.doesNotMatch(frame, /"path":/);
   view.unmount();
 });

@@ -2143,6 +2143,7 @@
         outside (java.io.File/createTempFile "bb-agent-outside-" ".txt")]
     (try
       (spit (io/file directory "sample.txt") "alpha\nbeta\n")
+      (spit (io/file directory "empty.txt") "")
       (spit outside "secret")
       (java.nio.file.Files/createSymbolicLink
        (.toPath (io/file directory "escape.txt"))
@@ -2185,15 +2186,49 @@
                      ((:render read-tool)
                       {:path "sample.txt" :offset 2 :limit 1}
                       read-result)))
-              (is (thrown-with-msg?
-                   clojure.lang.ExceptionInfo #"beyond end of file"
-                   ((:execute read-tool)
-                    {:path "sample.txt" :offset 3 :limit 1} {}))))
+              (let [beyond-eof-result
+                    ((:execute read-tool)
+                     {:path "sample.txt" :offset 3 :limit 1} {})]
+                (is (= "" (:content beyond-eof-result)))
+                (is (= 0 (:line-count beyond-eof-result)))
+                (is (= 2 (:total-lines beyond-eof-result)))
+                (is (= (str "[Offset 3 is beyond end of file "
+                            "(2 lines total); no lines returned.]")
+                       ((:render read-tool)
+                        {:path "sample.txt" :offset 3 :limit 1}
+                        beyond-eof-result))))
+              (let [empty-result
+                    ((:execute read-tool)
+                     {:path "empty.txt" :offset 2 :limit 1} {})]
+                (is (= "" (:content empty-result)))
+                (is (= 0 (:total-lines empty-result)))
+                (is (= (str "[Offset 2 is beyond end of file "
+                            "(0 lines total); no lines returned.]")
+                       ((:render read-tool)
+                        {:path "empty.txt" :offset 2 :limit 1}
+                        empty-result))))
+              (let [empty-result
+                    ((:execute read-tool)
+                     {:path "empty.txt" :offset 1 :limit 1} {})]
+                (is (= "[Read empty file (0 lines).]"
+                       ((:render read-tool)
+                        {:path "empty.txt" :offset 1 :limit 1}
+                        empty-result))))
+              (let [read-file-tool (kernel/tool ctx "read_file")
+                    alias-result
+                    ((:execute read-file-tool)
+                     {:path "sample.txt" :offset 3 :limit 1} {})]
+                (is (= "" (:content alias-result)))
+                (is (= (str "[Offset 3 is beyond end of file "
+                            "(2 lines total); no lines returned.]")
+                       ((:render read-file-tool)
+                        {:path "sample.txt" :offset 3 :limit 1}
+                        alias-result)))))
             ((:write! world) {:path "created.txt" :content "before"})
             ((:edit! world) {:path "created.txt" :old-text "before"
                              :new-text "after"})
             (is (= "after" (slurp (io/file directory "created.txt"))))
-            (is (= #{"created.txt" "escape.txt" "sample.txt"}
+            (is (= #{"created.txt" "empty.txt" "escape.txt" "sample.txt"}
                    (set (:items ((:find! world) {:pattern "*.txt"})))))
             (is (= "sample.txt" (get-in ((:search! world)
                                           {:query "beta"})

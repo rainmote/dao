@@ -6,6 +6,30 @@ export interface TerminalStreams {
   output: NodeJS.WriteStream;
   close(): void;
 }
+
+interface ListenerLimitEmitter {
+  getMaxListeners(): number;
+  setMaxListeners(count: number): unknown;
+}
+
+/**
+ * Ink's virtualized rows each own a resize listener through useBoxMetrics.
+ * Temporarily disable Node's generic listener-count warning for this one
+ * stream, then restore its previous limit after Ink has removed the listeners.
+ */
+export function allowOwnedResizeListeners(
+  output: ListenerLimitEmitter,
+): () => void {
+  const previousLimit = output.getMaxListeners();
+  output.setMaxListeners(0);
+  let restored = false;
+  return () => {
+    if (restored) return;
+    restored = true;
+    output.setMaxListeners(previousLimit);
+  };
+}
+
 /**
  * Open the controlling terminal while process stdin/stdout remain dedicated to
  * the plugin protocol. Ink needs real tty streams for raw input, dimensions,

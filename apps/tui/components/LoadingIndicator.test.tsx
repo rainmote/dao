@@ -35,12 +35,21 @@ function rerenderInAct(
   act(() => view.rerender(node));
 }
 
-test('ships the complete Qwen Chinese loading phrase set', () => {
-  assert.equal(QWEN_LOADING_PHRASES.length, 24);
+test('ships 50 additional individually written humorous loading phrases', () => {
+  assert.equal(QWEN_LOADING_PHRASES.length, 74);
+  assert.equal(
+    new Set(QWEN_LOADING_PHRASES).size,
+    QWEN_LOADING_PHRASES.length,
+  );
+  assert.ok(QWEN_LOADING_PHRASES.every((phrase) => phrase.trim().length > 0));
   assert.equal(QWEN_LOADING_PHRASES[0], '正在努力搬砖，请稍候...');
   assert.equal(
-    QWEN_LOADING_PHRASES.at(-1),
+    QWEN_LOADING_PHRASES[23],
     '加载的是字节，承载的是对技术的热爱...',
+  );
+  assert.equal(
+    QWEN_LOADING_PHRASES.at(-1),
+    '马上完成，只差一个无法估时的小问题...',
   );
 });
 
